@@ -1,15 +1,20 @@
 // blake2.cpp - written and placed in the public domain by Jeffrey Walton and Zooko
 //              Wilcox-O'Hearn. Copyright assigned to the Crypto++ project.
-//              Based on Aumasson, Neves, Wilcox-O’Hearn and Winnerlein's reference BLAKE2 
+//              Based on Aumasson, Neves, Wilcox-O'Hearn and Winnerlein's reference BLAKE2
 //              implementation at http://github.com/BLAKE2/BLAKE2.
 
 #include "pch.h"
 #include "config.h"
 #include "cryptlib.h"
+#include "argnames.h"
+#include "algparam.h"
 #include "blake2.h"
 #include "cpu.h"
 
 NAMESPACE_BEGIN(CryptoPP)
+
+// Uncomment for benchmarking C++ against NEON
+// #undef CRYPTOPP_BOOL_NEON_INTRINSICS_AVAILABLE
 
 // Visual Studio needs both VS2005 (1400) and _M_64 for SSE2 and _mm_set_epi64x()
 //  http://msdn.microsoft.com/en-us/library/y0dh78ez%28v=vs.80%29.aspx
@@ -43,10 +48,15 @@ static void BLAKE2_SSE4_Compress32(const byte* input, BLAKE2_State<word32, false
 static void BLAKE2_SSE4_Compress64(const byte* input, BLAKE2_State<word64, true>& state);
 #endif
 
+#if CRYPTOPP_BOOL_NEON_INTRINSICS_AVAILABLE
+static void BLAKE2_NEON_Compress32(const byte* input, BLAKE2_State<word32, false>& state);
+static void BLAKE2_NEON_Compress64(const byte* input, BLAKE2_State<word64, true>& state);
+#endif
+
 #ifndef CRYPTOPP_DOXYGEN_PROCESSING
 
-// IV and Sigma are a better fit as part of BLAKE2_Base, but that
-//   places the constants out of reach for the SSE2 and SSE4 implementations.
+// IV and Sigma are a better fit as part of BLAKE2_Base, but that places
+//   the constants out of reach for the NEON, SSE2 and SSE4 implementations.
 template<bool T_64bit>
 struct CRYPTOPP_NO_VTABLE BLAKE2_IV {};
 
@@ -55,7 +65,8 @@ template<>
 struct CRYPTOPP_NO_VTABLE BLAKE2_IV<false>
 {
 	CRYPTOPP_CONSTANT(IVSIZE = 8);
-	static const word32 iv[8];
+	// Always align for NEON and SSE
+	CRYPTOPP_ALIGN_DATA(16) static const word32 iv[8];
 };
 
 const word32 BLAKE2_IV<false>::iv[8] = {
@@ -63,11 +74,14 @@ const word32 BLAKE2_IV<false>::iv[8] = {
 	0x510E527FUL, 0x9B05688CUL, 0x1F83D9ABUL, 0x5BE0CD19UL
 };
 
+#define BLAKE2S_IV(n) BLAKE2_IV<false>::iv[n]
+
 template<>
 struct CRYPTOPP_NO_VTABLE BLAKE2_IV<true>
 {
 	CRYPTOPP_CONSTANT(IVSIZE = 8);
-	static const word64 iv[8];
+	// Always align for NEON and SSE
+	CRYPTOPP_ALIGN_DATA(16) static const word64 iv[8];
 };
 
 const word64 BLAKE2_IV<true>::iv[8] = {
@@ -77,15 +91,18 @@ const word64 BLAKE2_IV<true>::iv[8] = {
 	W64LIT(0x1f83d9abfb41bd6b), W64LIT(0x5be0cd19137e2179)
 };
 
-// IV and Sigma are a better fit as part of BLAKE2_Base, but that
-//   places the constants out of reach for the SSE2 and SSE4 implementations.
+#define BLAKE2B_IV(n) BLAKE2_IV<true>::iv[n]
+
+// IV and Sigma are a better fit as part of BLAKE2_Base, but that places
+//   the constants out of reach for the NEON, SSE2 and SSE4 implementations.
 template<bool T_64bit>
 struct CRYPTOPP_NO_VTABLE BLAKE2_Sigma {};
 
 template<>
 struct CRYPTOPP_NO_VTABLE BLAKE2_Sigma<false>
 {
-	static const byte sigma[10][16];
+	// Always align for NEON and SSE
+	CRYPTOPP_ALIGN_DATA(16) static const byte sigma[10][16];
 };
 
 const byte BLAKE2_Sigma<false>::sigma[10][16] = {
@@ -105,7 +122,8 @@ const byte BLAKE2_Sigma<false>::sigma[10][16] = {
 template<>
 struct CRYPTOPP_NO_VTABLE BLAKE2_Sigma<true>
 {
-	static const byte sigma[12][16];
+	// Always align for NEON and SSE
+	CRYPTOPP_ALIGN_DATA(16) static const byte sigma[12][16];
 };
 
 const byte BLAKE2_Sigma<true>::sigma[12][16] = {
@@ -122,31 +140,6 @@ const byte BLAKE2_Sigma<true>::sigma[12][16] = {
 	{  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15 },
 	{ 14, 10,  4,  8,  9, 15, 13,  6,  1, 12,  0,  2, 11,  7,  5,  3 }
 };
-
-// i-th word, not byte
-template<class W, bool T_64bit>
-inline W ReadWord(const BLAKE2_ParameterBlock<T_64bit>& block, size_t i)
-{
-	assert(sizeof(block) > ((i+1)*sizeof(W)) - 1);
-	const byte* p = reinterpret_cast<const byte*>(&block) + i*sizeof(W);
-	return GetWord<W>(true, LITTLE_ENDIAN_ORDER, p);
-}
-
-// i-th word, not byte
-template<class W, bool T_64bit>
-inline W ReadWord(const byte* block, size_t i)
-{
-	const byte* p = block + i*sizeof(W);
-	return GetWord<W>(true, LITTLE_ENDIAN_ORDER, p);
-}
-
-// i-th word, not byte
-template<class W, bool T_64bit>
-inline void WriteWord(W value, byte* block, size_t i)
-{
-	byte* p = block + i*sizeof(W);
-	PutWord<W>(true, LITTLE_ENDIAN_ORDER, p, value, NULL);
-}
 
 template<bool T_64bit>
 inline void ThrowIfInvalidSalt(size_t size)
@@ -177,6 +170,11 @@ pfnCompress64 InitializeCompress64Fn()
 		return &BLAKE2_SSE2_Compress64;
 	else
 #endif
+#if CRYPTOPP_BOOL_NEON_INTRINSICS_AVAILABLE
+	if (HasNEON())
+		return &BLAKE2_NEON_Compress64;
+	else
+#endif
 	return &BLAKE2_CXX_Compress64;
 }
 
@@ -190,6 +188,11 @@ pfnCompress32 InitializeCompress32Fn()
 #if CRYPTOPP_BOOL_SSE2_INTRINSICS_AVAILABLE
 	if (HasSSE2())
 		return &BLAKE2_SSE2_Compress32;
+	else
+#endif
+#if CRYPTOPP_BOOL_NEON_INTRINSICS_AVAILABLE
+	if (HasNEON())
+		return &BLAKE2_NEON_Compress32;
 	else
 #endif
 	return &BLAKE2_CXX_Compress32;
@@ -236,22 +239,60 @@ BLAKE2_ParameterBlock<true>::BLAKE2_ParameterBlock(size_t digestLen, size_t keyL
 }
 
 template <class W, bool T_64bit>
-void BLAKE2_Base<W, T_64bit>::UncheckedSetKey(const byte *key, unsigned int length, const CryptoPP::NameValuePairs&)
+void BLAKE2_Base<W, T_64bit>::UncheckedSetKey(const byte *key, unsigned int length, const CryptoPP::NameValuePairs& params)
 {
 	if (key && length)
 	{
-		AlignedSecByteBlock k(BLOCKSIZE);
-		memcpy_s(k, BLOCKSIZE, key, length);
+		AlignedSecByteBlock temp(BLOCKSIZE);
+		memcpy_s(temp, BLOCKSIZE, key, length);
 
 		const size_t rem = BLOCKSIZE - length;
 		if (rem)
-			memset(k+length, 0x00, rem);
+			memset(temp+length, 0x00, rem);
 
-		m_key.swap(k);
+		m_key.swap(temp);
 	}
 	else
 	{
 		m_key.resize(0);
+	}
+
+	// Zero everything except the two trailing strings
+	ParameterBlock& block = *m_block;
+	const size_t head = sizeof(block) - sizeof(block.personalization) - sizeof(block.salt);
+	memset(m_block.data(), 0x00, head);
+
+	block.keyLength = (byte)length;
+	block.digestLength = (byte)params.GetIntValueWithDefault(Name::DigestSize(), DIGESTSIZE);
+	block.fanout = block.depth = 1;
+
+	ConstByteArrayParameter t;
+	if (params.GetValue(Name::Salt(), t))
+	{
+		if (t.begin() && t.size())
+			memcpy_s(block.salt, sizeof(block.salt), t.begin(), t.size());
+
+		const size_t rem = sizeof(block.salt) - t.size();
+		if (rem)
+			memset(block.salt+rem, 0x00, rem);
+	}
+	else
+	{
+		memset(block.salt, 0x00, sizeof(block.salt));
+	}
+
+	if (params.GetValue(Name::Personalization(), t))
+	{
+		if (t.begin() && t.size())
+			memcpy_s(block.personalization, sizeof(block.personalization), t.begin(), t.size());
+
+		const size_t rem = sizeof(block.personalization) - t.size();
+		if (rem)
+			memset(block.personalization+rem, 0x00, rem);
+	}
+	else
+	{
+		memset(block.personalization, 0x00, sizeof(block.personalization));
 	}
 }
 
@@ -274,13 +315,15 @@ BLAKE2_Base<W, T_64bit>::BLAKE2_Base(bool treeMode, unsigned int digestSize) : m
 template <class W, bool T_64bit>
 BLAKE2_Base<W, T_64bit>::BLAKE2_Base(const byte *key, size_t keyLength, const byte* salt, size_t saltLength,
 	const byte* personalization, size_t personalizationLength, bool treeMode, unsigned int digestSize)
-	: m_block(ParameterBlock(digestSize, keyLength, salt, saltLength,
-	  personalization, personalizationLength)), m_digestSize(digestSize), m_treeMode(treeMode)
+	: m_digestSize(digestSize), m_treeMode(treeMode)
 {
 	this->ThrowIfInvalidKeyLength(keyLength);
 	this->ThrowIfInvalidTruncatedSize(digestSize);
+	ThrowIfInvalidSalt<T_64bit>(saltLength);
+	ThrowIfInvalidPersonalization<T_64bit>(personalizationLength);
 
-	UncheckedSetKey(key, static_cast<unsigned int>(keyLength), g_nullNameValuePairs);
+	UncheckedSetKey(key, static_cast<unsigned int>(keyLength), MakeParameters(Name::DigestSize(),(int)digestSize)(Name::TreeMode(),treeMode, false)
+		(Name::Salt(), ConstByteArrayParameter(salt, saltLength))(Name::Personalization(), ConstByteArrayParameter(personalization, personalizationLength)));
 	Restart();
 }
 
@@ -288,31 +331,33 @@ template <class W, bool T_64bit>
 void BLAKE2_Base<W, T_64bit>::Restart()
 {
 	static const W zero[2] = {0,0};
-	Restart(m_block, zero);
+	Restart(*m_block, zero);
 }
 
 template <class W, bool T_64bit>
 void BLAKE2_Base<W, T_64bit>::Restart(const BLAKE2_ParameterBlock<T_64bit>& block, const W counter[2])
 {
-	m_state.t[0] = m_state.t[1] = 0, m_state.f[0] = m_state.f[1] = 0, m_state.length = 0;
-	for(unsigned int i = 0; i < BLAKE2_IV<T_64bit>::IVSIZE; ++i)
-		m_state.h[i] = BLAKE2_IV<T_64bit>::iv[i];
-
-	if (&block != &m_block)
+	// We take a parameter block as a parameter to allow customized state.
+	// Avoid the copy of the parameter block when we are passing our own block.
+	if (&block != m_block.data())
 	{
-		m_block = block;
-		m_block.digestLength = (byte)m_digestSize;
-		m_block.keyLength = (byte)m_key.size();
+		memcpy_s(m_block, sizeof(block), &block, sizeof(block));
+		(*m_block).digestLength = (byte)m_digestSize;
+		(*m_block).keyLength = (byte)m_key.size();
 	}
+
+	State& state = *m_state;
+	state.t[0] = state.t[1] = 0, state.f[0] = state.f[1] = 0, state.length = 0;
 
 	if (counter != NULL)
 	{
-		m_state.t[0] = counter[0];
-		m_state.t[1] = counter[1];
+		state.t[0] = counter[0];
+		state.t[1] = counter[1];
 	}
 
-	for(unsigned int i = 0; i < BLAKE2_IV<T_64bit>::IVSIZE; ++i)
-		m_state.h[i] ^= ReadWord<W, T_64bit>(m_block, i);
+	PutBlock<W, LittleEndian, true> put(m_block, &state.h[0]);
+	put(BLAKE2_IV<T_64bit>::iv[0])(BLAKE2_IV<T_64bit>::iv[1])(BLAKE2_IV<T_64bit>::iv[2])(BLAKE2_IV<T_64bit>::iv[3]);
+	put(BLAKE2_IV<T_64bit>::iv[4])(BLAKE2_IV<T_64bit>::iv[5])(BLAKE2_IV<T_64bit>::iv[6])(BLAKE2_IV<T_64bit>::iv[7]);
 
 	// When BLAKE2 is keyed, the input stream is simply {key||message}. Key it
 	// during Restart to avoid FirstPut and friends. Key size == 0 means no key.
@@ -323,63 +368,64 @@ void BLAKE2_Base<W, T_64bit>::Restart(const BLAKE2_ParameterBlock<T_64bit>& bloc
 template <class W, bool T_64bit>
 void BLAKE2_Base<W, T_64bit>::Update(const byte *input, size_t length)
 {
-	if (m_state.length + length > BLOCKSIZE)
+	State& state = *m_state;
+	if (state.length + length > BLOCKSIZE)
 	{
 		// Complete current block
-		const size_t fill = BLOCKSIZE - m_state.length;
-		memcpy_s(&m_state.buffer[m_state.length], fill, input, fill);
+		const size_t fill = BLOCKSIZE - state.length;
+		memcpy_s(&state.buffer[state.length], fill, input, fill);
 
 		IncrementCounter();
-		Compress(m_state.buffer);
-		m_state.length = 0;
+		Compress(state.buffer);
+		state.length = 0;
 
-		length -= fill;
-		input += fill;
+		length -= fill, input += fill;
 
 		// Compress in-place to avoid copies
 		while (length > BLOCKSIZE)
 		{
 			IncrementCounter();
 			Compress(input);
-			length -= BLOCKSIZE;
-			input += BLOCKSIZE;
+			length -= BLOCKSIZE, input += BLOCKSIZE;
 		}
 	}
 
 	if (input && length)
 	{
-		memcpy_s(&m_state.buffer[m_state.length], BLOCKSIZE - m_state.length, input, length);
-		m_state.length += static_cast<unsigned int>(length);
+		memcpy_s(&state.buffer[state.length], BLOCKSIZE - state.length, input, length);
+		state.length += static_cast<unsigned int>(length);
 	}
 }
 
 template <class W, bool T_64bit>
 void BLAKE2_Base<W, T_64bit>::TruncatedFinal(byte *hash, size_t size)
 {
+	State& state = *m_state;
+
 	// Set last block unconditionally
-	m_state.f[0] = static_cast<W>(-1);
+	state.f[0] = static_cast<W>(-1);
 
 	// Set last node if tree mode
 	if (m_treeMode)
-		m_state.f[1] = static_cast<W>(-1);
+		state.f[1] = static_cast<W>(-1);
 
 	// Increment counter for tail bytes only
-	IncrementCounter(m_state.length);
+	IncrementCounter(state.length);
 
-	memset(m_state.buffer + m_state.length, 0x00, BLOCKSIZE - m_state.length);
-	Compress(m_state.buffer);
+	memset(state.buffer + state.length, 0x00, BLOCKSIZE - state.length);
+	Compress(state.buffer);
 
-	if (size >= DIGESTSIZE) 
+	if (size >= DIGESTSIZE)
 	{
 		// Write directly to the caller buffer
-		for(unsigned int i = 0; i < 8; ++i)
-			WriteWord<W, T_64bit>(m_state.h[i], hash, i);
+		PutBlock<W, LittleEndian, false> put(NULL, hash);
+		put(state.h[0])(state.h[1])(state.h[2])(state.h[3])(state.h[4])(state.h[5])(state.h[6])(state.h[7]);
 	}
 	else
 	{
-		FixedSizeAlignedSecBlock<byte, DIGESTSIZE, CRYPTOPP_BOOL_ALIGN16>  buffer;
-		for(unsigned int i = 0; i < 8; ++i)
-			WriteWord<W, T_64bit>(m_state.h[i], buffer, i);
+		FixedSizeAlignedSecBlock<byte, DIGESTSIZE, CRYPTOPP_BOOL_ALIGN16> buffer;
+		PutBlock<W, LittleEndian, true> put(NULL, buffer);
+		put(state.h[0])(state.h[1])(state.h[2])(state.h[3])(state.h[4])(state.h[5])(state.h[6])(state.h[7]);
 
 		memcpy_s(hash, DIGESTSIZE, buffer, size);
 	}
@@ -390,8 +436,9 @@ void BLAKE2_Base<W, T_64bit>::TruncatedFinal(byte *hash, size_t size)
 template <class W, bool T_64bit>
 void BLAKE2_Base<W, T_64bit>::IncrementCounter(size_t count)
 {
-	m_state.t[0] += static_cast<W>(count);
-	m_state.t[1] += !!(m_state.t[0] < count);
+	State& state = *m_state;
+	state.t[0] += static_cast<W>(count);
+	state.t[1] += !!(state.t[0] < count);
 }
 
 template <>
@@ -399,7 +446,7 @@ void BLAKE2_Base<word64, true>::Compress(const byte *input)
 {
 	// Selects the most advanced implmentation at runtime
 	static const pfnCompress64 s_pfn = InitializeCompress64Fn();
-	s_pfn(input, m_state);
+	s_pfn(input, *m_state);
 }
 
 template <>
@@ -407,7 +454,7 @@ void BLAKE2_Base<word32, false>::Compress(const byte *input)
 {
 	// Selects the most advanced implmentation at runtime
 	static const pfnCompress32 s_pfn = InitializeCompress32Fn();
-	s_pfn(input, m_state);
+	s_pfn(input, *m_state);
 }
 
 void BLAKE2_CXX_Compress64(const byte* input, BLAKE2_State<word64, true>& state)
@@ -442,20 +489,20 @@ void BLAKE2_CXX_Compress64(const byte* input, BLAKE2_State<word64, true>& state)
 	word64 m[16], v[16];
 	unsigned int i;
 
-	for(i = 0; i < 16; ++i)
- 		m[i] = ReadWord<word64, true>(input, i);
+	GetBlock<word64, LittleEndian, true> get1(input);
+	get1(m[0])(m[1])(m[2])(m[3])(m[4])(m[5])(m[6])(m[7])(m[8])(m[9])(m[10])(m[11])(m[12])(m[13])(m[14])(m[15]);
 
-	for(i = 0; i < 8; ++i)
-		v[i] = state.h[i];
+	GetBlock<word64, LittleEndian, true> get2(&state.h[0]);
+	get2(v[0])(v[1])(v[2])(v[3])(v[4])(v[5])(v[6])(v[7]);
 
-	v[ 8] = BLAKE2_IV<true>::iv[0];
-	v[ 9] = BLAKE2_IV<true>::iv[1];
-	v[10] = BLAKE2_IV<true>::iv[2];
-	v[11] = BLAKE2_IV<true>::iv[3];
-	v[12] = state.t[0] ^ BLAKE2_IV<true>::iv[4];
-	v[13] = state.t[1] ^ BLAKE2_IV<true>::iv[5];
-	v[14] = state.f[0] ^ BLAKE2_IV<true>::iv[6];
-	v[15] = state.f[1] ^ BLAKE2_IV<true>::iv[7];
+	v[ 8] = BLAKE2B_IV(0);
+	v[ 9] = BLAKE2B_IV(1);
+	v[10] = BLAKE2B_IV(2);
+	v[11] = BLAKE2B_IV(3);
+	v[12] = state.t[0] ^ BLAKE2B_IV(4);
+	v[13] = state.t[1] ^ BLAKE2B_IV(5);
+	v[14] = state.f[0] ^ BLAKE2B_IV(6);
+	v[15] = state.f[1] ^ BLAKE2B_IV(7);
 
 	BLAKE2_ROUND( 0 );
 	BLAKE2_ROUND( 1 );
@@ -504,22 +551,21 @@ void BLAKE2_CXX_Compress32(const byte* input, BLAKE2_State<word32, false>& state
 	  } while(0)
 
 	word32 m[16], v[16];
-	unsigned int i;
 
-	for(i = 0; i < 16; ++i)
-		m[i] = ReadWord<word32, false>(input, i);
+	GetBlock<word32, LittleEndian, true> get1(input);
+	get1(m[0])(m[1])(m[2])(m[3])(m[4])(m[5])(m[6])(m[7])(m[8])(m[9])(m[10])(m[11])(m[12])(m[13])(m[14])(m[15]);
 
-	for(i = 0; i < 8; ++i)
-		v[i] = state.h[i];
+	GetBlock<word32, LittleEndian, true> get2(&state.h[0]);
+	get2(v[0])(v[1])(v[2])(v[3])(v[4])(v[5])(v[6])(v[7]);
 
-	v[ 8] = BLAKE2_IV<false>::iv[0];
-	v[ 9] = BLAKE2_IV<false>::iv[1];
-	v[10] = BLAKE2_IV<false>::iv[2];
-	v[11] = BLAKE2_IV<false>::iv[3];
-	v[12] = state.t[0] ^ BLAKE2_IV<false>::iv[4];
-	v[13] = state.t[1] ^ BLAKE2_IV<false>::iv[5];
-	v[14] = state.f[0] ^ BLAKE2_IV<false>::iv[6];
-	v[15] = state.f[1] ^ BLAKE2_IV<false>::iv[7];
+	v[ 8] = BLAKE2S_IV(0);
+	v[ 9] = BLAKE2S_IV(1);
+	v[10] = BLAKE2S_IV(2);
+	v[11] = BLAKE2S_IV(3);
+	v[12] = state.t[0] ^ BLAKE2S_IV(4);
+	v[13] = state.t[1] ^ BLAKE2S_IV(5);
+	v[14] = state.f[0] ^ BLAKE2S_IV(6);
+	v[15] = state.f[1] ^ BLAKE2S_IV(7);
 
 	BLAKE2_ROUND( 0 );
 	BLAKE2_ROUND( 1 );
@@ -532,38 +578,25 @@ void BLAKE2_CXX_Compress32(const byte* input, BLAKE2_State<word32, false>& state
 	BLAKE2_ROUND( 8 );
 	BLAKE2_ROUND( 9 );
 
-	for(i = 0; i < 8; ++i)
+	for(unsigned int i = 0; i < 8; ++i)
 		state.h[i] = state.h[i] ^ v[i] ^ v[i + 8];
 }
 
 #if CRYPTOPP_BOOL_SSE2_INTRINSICS_AVAILABLE
 static void BLAKE2_SSE2_Compress32(const byte* input, BLAKE2_State<word32, false>& state)
 {
+  word32 m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15;
+  GetBlock<word32, LittleEndian, true> get(input);
+  get(m0)(m1)(m2)(m3)(m4)(m5)(m6)(m7)(m8)(m9)(m10)(m11)(m12)(m13)(m14)(m15);
+
   __m128i row1,row2,row3,row4;
   __m128i buf1,buf2,buf3,buf4;
   __m128i ff0,ff1;
 
-  const word32 m0 = ((const word32*)(const void*)input)[ 0];
-  const word32 m1 = ((const word32*)(const void*)input)[ 1];
-  const word32 m2 = ((const word32*)(const void*)input)[ 2];
-  const word32 m3 = ((const word32*)(const void*)input)[ 3];
-  const word32 m4 = ((const word32*)(const void*)input)[ 4];
-  const word32 m5 = ((const word32*)(const void*)input)[ 5];
-  const word32 m6 = ((const word32*)(const void*)input)[ 6];
-  const word32 m7 = ((const word32*)(const void*)input)[ 7];
-  const word32 m8 = ((const word32*)(const void*)input)[ 8];
-  const word32 m9 = ((const word32*)(const void*)input)[ 9];
-  const word32 m10 = ((const word32*)(const void*)input)[10];
-  const word32 m11 = ((const word32*)(const void*)input)[11];
-  const word32 m12 = ((const word32*)(const void*)input)[12];
-  const word32 m13 = ((const word32*)(const void*)input)[13];
-  const word32 m14 = ((const word32*)(const void*)input)[14];
-  const word32 m15 = ((const word32*)(const void*)input)[15];
-
   row1 = ff0 = _mm_loadu_si128((const __m128i*)(const void*)(&state.h[0]));
   row2 = ff1 = _mm_loadu_si128((const __m128i*)(const void*)(&state.h[4]));
-  row3 = _mm_setr_epi32(BLAKE2_IV<false>::iv[0],BLAKE2_IV<false>::iv[1],BLAKE2_IV<false>::iv[2],BLAKE2_IV<false>::iv[3]);
-  row4 = _mm_xor_si128(_mm_setr_epi32(BLAKE2_IV<false>::iv[4],BLAKE2_IV<false>::iv[5],BLAKE2_IV<false>::iv[6],BLAKE2_IV<false>::iv[7]),_mm_loadu_si128((const __m128i*)(const void*)(&state.t[0])));
+  row3 = _mm_setr_epi32(BLAKE2S_IV(0),BLAKE2S_IV(1),BLAKE2S_IV(2),BLAKE2S_IV(3));
+  row4 = _mm_xor_si128(_mm_setr_epi32(BLAKE2S_IV(4),BLAKE2S_IV(5),BLAKE2S_IV(6),BLAKE2S_IV(7)),_mm_loadu_si128((const __m128i*)(const void*)(&state.t[0])));
   buf1 = _mm_set_epi32(m6,m4,m2,m0);
   row1 = _mm_add_epi32(_mm_add_epi32(row1,buf1),row2);
   row4 = _mm_xor_si128(row4,row1);
@@ -643,7 +676,7 @@ static void BLAKE2_SSE2_Compress32(const byte* input, BLAKE2_State<word32, false
   row4 = _mm_shuffle_epi32(row4,_MM_SHUFFLE(0,3,2,1));
   row3 = _mm_shuffle_epi32(row3,_MM_SHUFFLE(1,0,3,2));
   row2 = _mm_shuffle_epi32(row2,_MM_SHUFFLE(2,1,0,3));
-  
+
   buf1 = _mm_set_epi32(m15,m5,m12,m11);
   row1 = _mm_add_epi32(_mm_add_epi32(row1,buf1),row2);
   row4 = _mm_xor_si128(row4,row1);
@@ -683,7 +716,7 @@ static void BLAKE2_SSE2_Compress32(const byte* input, BLAKE2_State<word32, false
   row4 = _mm_shuffle_epi32(row4,_MM_SHUFFLE(0,3,2,1));
   row3 = _mm_shuffle_epi32(row3,_MM_SHUFFLE(1,0,3,2));
   row2 = _mm_shuffle_epi32(row2,_MM_SHUFFLE(2,1,0,3));
-  
+
   buf1 = _mm_set_epi32(m11,m13,m3,m7);
   row1 = _mm_add_epi32(_mm_add_epi32(row1,buf1),row2);
   row4 = _mm_xor_si128(row4,row1);
@@ -723,7 +756,7 @@ static void BLAKE2_SSE2_Compress32(const byte* input, BLAKE2_State<word32, false
   row4 = _mm_shuffle_epi32(row4,_MM_SHUFFLE(0,3,2,1));
   row3 = _mm_shuffle_epi32(row3,_MM_SHUFFLE(1,0,3,2));
   row2 = _mm_shuffle_epi32(row2,_MM_SHUFFLE(2,1,0,3));
-  
+
   buf1 = _mm_set_epi32(m10,m2,m5,m9);
   row1 = _mm_add_epi32(_mm_add_epi32(row1,buf1),row2);
   row4 = _mm_xor_si128(row4,row1);
@@ -763,7 +796,7 @@ static void BLAKE2_SSE2_Compress32(const byte* input, BLAKE2_State<word32, false
   row4 = _mm_shuffle_epi32(row4,_MM_SHUFFLE(0,3,2,1));
   row3 = _mm_shuffle_epi32(row3,_MM_SHUFFLE(1,0,3,2));
   row2 = _mm_shuffle_epi32(row2,_MM_SHUFFLE(2,1,0,3));
-  
+
   buf1 = _mm_set_epi32(m8,m0,m6,m2);
   row1 = _mm_add_epi32(_mm_add_epi32(row1,buf1),row2);
   row4 = _mm_xor_si128(row4,row1);
@@ -803,7 +836,7 @@ static void BLAKE2_SSE2_Compress32(const byte* input, BLAKE2_State<word32, false
   row4 = _mm_shuffle_epi32(row4,_MM_SHUFFLE(0,3,2,1));
   row3 = _mm_shuffle_epi32(row3,_MM_SHUFFLE(1,0,3,2));
   row2 = _mm_shuffle_epi32(row2,_MM_SHUFFLE(2,1,0,3));
-  
+
   buf1 = _mm_set_epi32(m4,m14,m1,m12);
   row1 = _mm_add_epi32(_mm_add_epi32(row1,buf1),row2);
   row4 = _mm_xor_si128(row4,row1);
@@ -843,7 +876,7 @@ static void BLAKE2_SSE2_Compress32(const byte* input, BLAKE2_State<word32, false
   row4 = _mm_shuffle_epi32(row4,_MM_SHUFFLE(0,3,2,1));
   row3 = _mm_shuffle_epi32(row3,_MM_SHUFFLE(1,0,3,2));
   row2 = _mm_shuffle_epi32(row2,_MM_SHUFFLE(2,1,0,3));
-  
+
   buf1 = _mm_set_epi32(m3,m12,m7,m13);
   row1 = _mm_add_epi32(_mm_add_epi32(row1,buf1),row2);
   row4 = _mm_xor_si128(row4,row1);
@@ -883,7 +916,7 @@ static void BLAKE2_SSE2_Compress32(const byte* input, BLAKE2_State<word32, false
   row4 = _mm_shuffle_epi32(row4,_MM_SHUFFLE(0,3,2,1));
   row3 = _mm_shuffle_epi32(row3,_MM_SHUFFLE(1,0,3,2));
   row2 = _mm_shuffle_epi32(row2,_MM_SHUFFLE(2,1,0,3));
-  
+
   buf1 = _mm_set_epi32(m0,m11,m14,m6);
   row1 = _mm_add_epi32(_mm_add_epi32(row1,buf1),row2);
   row4 = _mm_xor_si128(row4,row1);
@@ -923,7 +956,7 @@ static void BLAKE2_SSE2_Compress32(const byte* input, BLAKE2_State<word32, false
   row4 = _mm_shuffle_epi32(row4,_MM_SHUFFLE(0,3,2,1));
   row3 = _mm_shuffle_epi32(row3,_MM_SHUFFLE(1,0,3,2));
   row2 = _mm_shuffle_epi32(row2,_MM_SHUFFLE(2,1,0,3));
-  
+
   buf1 = _mm_set_epi32(m1,m7,m8,m10);
   row1 = _mm_add_epi32(_mm_add_epi32(row1,buf1),row2);
   row4 = _mm_xor_si128(row4,row1);
@@ -963,42 +996,29 @@ static void BLAKE2_SSE2_Compress32(const byte* input, BLAKE2_State<word32, false
   row4 = _mm_shuffle_epi32(row4,_MM_SHUFFLE(0,3,2,1));
   row3 = _mm_shuffle_epi32(row3,_MM_SHUFFLE(1,0,3,2));
   row2 = _mm_shuffle_epi32(row2,_MM_SHUFFLE(2,1,0,3));
-  
+
   _mm_storeu_si128((__m128i *)(void*)(&state.h[0]),_mm_xor_si128(ff0,_mm_xor_si128(row1,row3)));
   _mm_storeu_si128((__m128i *)(void*)(&state.h[4]),_mm_xor_si128(ff1,_mm_xor_si128(row2,row4)));
 }
 
 static void BLAKE2_SSE2_Compress64(const byte* input, BLAKE2_State<word64, true>& state)
 {
+  word64 m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15;
+  GetBlock<word64, LittleEndian, true> get(input);
+  get(m0)(m1)(m2)(m3)(m4)(m5)(m6)(m7)(m8)(m9)(m10)(m11)(m12)(m13)(m14)(m15);
+
   __m128i row1l, row1h, row2l, row2h;
   __m128i row3l, row3h, row4l, row4h;
   __m128i b0, b1, t0, t1;
 
-  const word64 m0 =  ((const word64*)(const void*)input)[ 0];
-  const word64 m1 =  ((const word64*)(const void*)input)[ 1];
-  const word64 m2 =  ((const word64*)(const void*)input)[ 2];
-  const word64 m3 =  ((const word64*)(const void*)input)[ 3];
-  const word64 m4 =  ((const word64*)(const void*)input)[ 4];
-  const word64 m5 =  ((const word64*)(const void*)input)[ 5];
-  const word64 m6 =  ((const word64*)(const void*)input)[ 6];
-  const word64 m7 =  ((const word64*)(const void*)input)[ 7];
-  const word64 m8 =  ((const word64*)(const void*)input)[ 8];
-  const word64 m9 =  ((const word64*)(const void*)input)[ 9];
-  const word64 m10 = ((const word64*)(const void*)input)[10];
-  const word64 m11 = ((const word64*)(const void*)input)[11];
-  const word64 m12 = ((const word64*)(const void*)input)[12];
-  const word64 m13 = ((const word64*)(const void*)input)[13];
-  const word64 m14 = ((const word64*)(const void*)input)[14];
-  const word64 m15 = ((const word64*)(const void*)input)[15];
-
-  row1l = _mm_loadu_si128((const __m128i*)(const void*)(&state.h[0]) );
-  row1h = _mm_loadu_si128((const __m128i*)(const void*)(&state.h[2]) );
-  row2l = _mm_loadu_si128((const __m128i*)(const void*)(&state.h[4]) );
-  row2h = _mm_loadu_si128((const __m128i*)(const void*)(&state.h[6]) );
-  row3l = _mm_loadu_si128((const __m128i*)(const void*)(&BLAKE2_IV<true>::iv[0]) );
-  row3h = _mm_loadu_si128((const __m128i*)(const void*)(&BLAKE2_IV<true>::iv[2]) );
-  row4l = _mm_xor_si128( _mm_loadu_si128((const __m128i*)(const void*)(&BLAKE2_IV<true>::iv[4]) ), _mm_loadu_si128((const __m128i*)(const void*)(&state.t[0]) ) );
-  row4h = _mm_xor_si128( _mm_loadu_si128((const __m128i*)(const void*)(&BLAKE2_IV<true>::iv[6]) ), _mm_loadu_si128((const __m128i*)(const void*)(&state.f[0]) ) );
+  row1l = _mm_loadu_si128((const __m128i*)(const void*)(&state.h[0]));
+  row1h = _mm_loadu_si128((const __m128i*)(const void*)(&state.h[2]));
+  row2l = _mm_loadu_si128((const __m128i*)(const void*)(&state.h[4]));
+  row2h = _mm_loadu_si128((const __m128i*)(const void*)(&state.h[6]));
+  row3l = _mm_loadu_si128((const __m128i*)(const void*)(&BLAKE2B_IV(0)));
+  row3h = _mm_loadu_si128((const __m128i*)(const void*)(&BLAKE2B_IV(2)));
+  row4l = _mm_xor_si128(_mm_loadu_si128((const __m128i*)(const void*)(&BLAKE2B_IV(4))), _mm_loadu_si128((const __m128i*)(const void*)(&state.t[0])));
+  row4h = _mm_xor_si128(_mm_loadu_si128((const __m128i*)(const void*)(&BLAKE2B_IV(6))), _mm_loadu_si128((const __m128i*)(const void*)(&state.f[0])));
 
   b0 = _mm_set_epi64x(m2, m0);
   b1 = _mm_set_epi64x(m6, m4);
@@ -1012,8 +1032,8 @@ static void BLAKE2_SSE2_Compress64(const byte* input, BLAKE2_State<word64, true>
   row3h = _mm_add_epi64(row3h, row4h);
   row2l = _mm_xor_si128(row2l, row3l);
   row2h = _mm_xor_si128(row2h, row3h);
-  row2l = _mm_xor_si128(_mm_srli_epi64(row2l,24),_mm_slli_epi64(row2l, 40 ));
-  row2h = _mm_xor_si128(_mm_srli_epi64(row2h,24),_mm_slli_epi64(row2h, 40 ));
+  row2l = _mm_xor_si128(_mm_srli_epi64(row2l,24),_mm_slli_epi64(row2l, 40));
+  row2h = _mm_xor_si128(_mm_srli_epi64(row2h,24),_mm_slli_epi64(row2h, 40));
 
   b0 = _mm_set_epi64x(m3, m1);
   b1 = _mm_set_epi64x(m7, m5);
@@ -1035,6 +1055,7 @@ static void BLAKE2_SSE2_Compress64(const byte* input, BLAKE2_State<word64, true>
   row4h = _mm_unpackhi_epi64(t0, _mm_unpacklo_epi64(row4h, row4h));
   row2l = _mm_unpackhi_epi64(row2l, _mm_unpacklo_epi64(row2h, row2h));
   row2h = _mm_unpackhi_epi64(row2h, _mm_unpacklo_epi64(t1, t1));
+
   b0 = _mm_set_epi64x(m10, m8);
   b1 = _mm_set_epi64x(m14, m12);
   row1l = _mm_add_epi64(_mm_add_epi64(row1l, b0), row2l);
@@ -1746,6 +1767,7 @@ static void BLAKE2_SSE2_Compress64(const byte* input, BLAKE2_State<word64, true>
   row4h = _mm_unpackhi_epi64(t0, _mm_unpacklo_epi64(row4h, row4h));
   row2l = _mm_unpackhi_epi64(row2l, _mm_unpacklo_epi64(row2h, row2h));
   row2h = _mm_unpackhi_epi64(row2h, _mm_unpacklo_epi64(t1, t1));
+
   b0 = _mm_set_epi64x(m10, m8);
   b1 = _mm_set_epi64x(m14, m12);
   row1l = _mm_add_epi64(_mm_add_epi64(row1l, b0), row2l);
@@ -1853,15 +1875,15 @@ static void BLAKE2_SSE2_Compress64(const byte* input, BLAKE2_State<word64, true>
   row4l = _mm_unpackhi_epi64(row4l, _mm_unpacklo_epi64(row4h, row4h));
   row4h = _mm_unpackhi_epi64(row4h, _mm_unpacklo_epi64(t1, t1));
 
-  row1l = _mm_xor_si128( row3l, row1l );
-  row1h = _mm_xor_si128( row3h, row1h );
-  _mm_storeu_si128((__m128i *)(void*)(&state.h[0]), _mm_xor_si128(_mm_loadu_si128((const __m128i*)(const void*)(&state.h[0]) ), row1l));
-  _mm_storeu_si128((__m128i *)(void*)(&state.h[2]), _mm_xor_si128(_mm_loadu_si128((const __m128i*)(const void*)(&state.h[2]) ), row1h));
+  row1l = _mm_xor_si128(row3l, row1l);
+  row1h = _mm_xor_si128(row3h, row1h);
+  _mm_storeu_si128((__m128i *)(void*)(&state.h[0]), _mm_xor_si128(_mm_loadu_si128((const __m128i*)(const void*)(&state.h[0])), row1l));
+  _mm_storeu_si128((__m128i *)(void*)(&state.h[2]), _mm_xor_si128(_mm_loadu_si128((const __m128i*)(const void*)(&state.h[2])), row1h));
 
-  row2l = _mm_xor_si128( row4l, row2l );
-  row2h = _mm_xor_si128( row4h, row2h );
-  _mm_storeu_si128((__m128i *)(void*)(&state.h[4]), _mm_xor_si128(_mm_loadu_si128((const __m128i*)(const void*)(&state.h[4]) ), row2l));
-  _mm_storeu_si128((__m128i *)(void*)(&state.h[6]), _mm_xor_si128(_mm_loadu_si128((const __m128i*)(const void*)(&state.h[6]) ), row2h));
+  row2l = _mm_xor_si128(row4l, row2l);
+  row2h = _mm_xor_si128(row4h, row2h);
+  _mm_storeu_si128((__m128i *)(void*)(&state.h[4]), _mm_xor_si128(_mm_loadu_si128((const __m128i*)(const void*)(&state.h[4])), row2l));
+  _mm_storeu_si128((__m128i *)(void*)(&state.h[6]), _mm_xor_si128(_mm_loadu_si128((const __m128i*)(const void*)(&state.h[6])), row2h));
 }
 #endif  // CRYPTOPP_BOOL_SSE2_INTRINSICS_AVAILABLE
 
@@ -1884,8 +1906,8 @@ static void BLAKE2_SSE4_Compress32(const byte* input, BLAKE2_State<word32, false
 
   row1 = ff0 = _mm_loadu_si128((const __m128i*)(const void*)(&state.h[0]));
   row2 = ff1 = _mm_loadu_si128((const __m128i*)(const void*)(&state.h[4]));
-  row3 = _mm_setr_epi32(BLAKE2_IV<false>::iv[0], BLAKE2_IV<false>::iv[1], BLAKE2_IV<false>::iv[2], BLAKE2_IV<false>::iv[3]);
-  row4 = _mm_xor_si128(_mm_setr_epi32(BLAKE2_IV<false>::iv[4], BLAKE2_IV<false>::iv[5], BLAKE2_IV<false>::iv[6], BLAKE2_IV<false>::iv[7]), _mm_loadu_si128((const __m128i*)(const void*)(&state.t[0])));
+  row3 = _mm_setr_epi32(BLAKE2S_IV(0), BLAKE2S_IV(1), BLAKE2S_IV(2), BLAKE2S_IV(3));
+  row4 = _mm_xor_si128(_mm_setr_epi32(BLAKE2S_IV(4), BLAKE2S_IV(5), BLAKE2S_IV(6), BLAKE2S_IV(7)), _mm_loadu_si128((const __m128i*)(const void*)(&state.t[0])));
   buf1 = _mm_castps_si128((_mm_shuffle_ps(_mm_castsi128_ps((m0)), _mm_castsi128_ps((m1)), _MM_SHUFFLE(2,0,2,0))));
 
   row1 = _mm_add_epi32(_mm_add_epi32(row1, buf1), row2);
@@ -2445,10 +2467,10 @@ static void BLAKE2_SSE4_Compress64(const byte* input, BLAKE2_State<word64, true>
   row1h = _mm_loadu_si128((const __m128i*)(const void*)(&state.h[2]));
   row2l = _mm_loadu_si128((const __m128i*)(const void*)(&state.h[4]));
   row2h = _mm_loadu_si128((const __m128i*)(const void*)(&state.h[6]));
-  row3l = _mm_loadu_si128((const __m128i*)(const void*)(&BLAKE2_IV<true>::iv[0]));
-  row3h = _mm_loadu_si128((const __m128i*)(const void*)(&BLAKE2_IV<true>::iv[2]));
-  row4l = _mm_xor_si128(_mm_loadu_si128((const __m128i*)(const void*)(&BLAKE2_IV<true>::iv[4])), _mm_loadu_si128((const __m128i*)(const void*)(&state.t[0])));
-  row4h = _mm_xor_si128(_mm_loadu_si128((const __m128i*)(const void*)(&BLAKE2_IV<true>::iv[6])), _mm_loadu_si128((const __m128i*)(const void*)(&state.f[0])));
+  row3l = _mm_loadu_si128((const __m128i*)(const void*)(&BLAKE2B_IV(0)));
+  row3h = _mm_loadu_si128((const __m128i*)(const void*)(&BLAKE2B_IV(2)));
+  row4l = _mm_xor_si128(_mm_loadu_si128((const __m128i*)(const void*)(&BLAKE2B_IV(4))), _mm_loadu_si128((const __m128i*)(const void*)(&state.t[0])));
+  row4h = _mm_xor_si128(_mm_loadu_si128((const __m128i*)(const void*)(&BLAKE2B_IV(6))), _mm_loadu_si128((const __m128i*)(const void*)(&state.f[0])));
 
   b0 = _mm_unpacklo_epi64(m0, m1);
   b1 = _mm_unpacklo_epi64(m2, m3);
@@ -2526,7 +2548,7 @@ static void BLAKE2_SSE4_Compress64(const byte* input, BLAKE2_State<word64, true>
   t0 = _mm_alignr_epi8(row4l, row4h, 8);
   t1 = _mm_alignr_epi8(row4h, row4l, 8);
   row4l = t1, row4h = t0;
-  
+
   b0 = _mm_unpacklo_epi64(m7, m2);
   b1 = _mm_unpackhi_epi64(m4, m6);
 
@@ -2604,7 +2626,7 @@ static void BLAKE2_SSE4_Compress64(const byte* input, BLAKE2_State<word64, true>
   t0 = _mm_alignr_epi8(row4l, row4h, 8);
   t1 = _mm_alignr_epi8(row4h, row4l, 8);
   row4l = t1, row4h = t0;
-  
+
   b0 = _mm_alignr_epi8(m6, m5, 8);
   b1 = _mm_unpackhi_epi64(m2, m7);
 
@@ -2682,7 +2704,7 @@ static void BLAKE2_SSE4_Compress64(const byte* input, BLAKE2_State<word64, true>
   t0 = _mm_alignr_epi8(row4l, row4h, 8);
   t1 = _mm_alignr_epi8(row4h, row4l, 8);
   row4l = t1, row4h = t0;
-  
+
   b0 = _mm_unpackhi_epi64(m3, m1);
   b1 = _mm_unpackhi_epi64(m6, m5);
 
@@ -2760,7 +2782,7 @@ static void BLAKE2_SSE4_Compress64(const byte* input, BLAKE2_State<word64, true>
   t0 = _mm_alignr_epi8(row4l, row4h, 8);
   t1 = _mm_alignr_epi8(row4h, row4l, 8);
   row4l = t1, row4h = t0;
-  
+
   b0 = _mm_unpackhi_epi64(m4, m2);
   b1 = _mm_unpacklo_epi64(m1, m5);
 
@@ -2838,7 +2860,7 @@ static void BLAKE2_SSE4_Compress64(const byte* input, BLAKE2_State<word64, true>
   t0 = _mm_alignr_epi8(row4l, row4h, 8);
   t1 = _mm_alignr_epi8(row4h, row4l, 8);
   row4l = t1, row4h = t0;
-  
+
   b0 = _mm_unpacklo_epi64(m1, m3);
   b1 = _mm_unpacklo_epi64(m0, m4);
 
@@ -2916,7 +2938,7 @@ static void BLAKE2_SSE4_Compress64(const byte* input, BLAKE2_State<word64, true>
   t0 = _mm_alignr_epi8(row4l, row4h, 8);
   t1 = _mm_alignr_epi8(row4h, row4l, 8);
   row4l = t1, row4h = t0;
-  
+
   b0 = _mm_blend_epi16(m6, m0, 0xF0);
   b1 = _mm_unpacklo_epi64(m7, m2);
 
@@ -2994,7 +3016,7 @@ static void BLAKE2_SSE4_Compress64(const byte* input, BLAKE2_State<word64, true>
   t0 = _mm_alignr_epi8(row4l, row4h, 8);
   t1 = _mm_alignr_epi8(row4h, row4l, 8);
   row4l = t1, row4h = t0;
-  
+
   b0 = _mm_unpackhi_epi64(m6, m3);
   b1 = _mm_blend_epi16(m6, m1, 0xF0);
 
@@ -3072,7 +3094,7 @@ static void BLAKE2_SSE4_Compress64(const byte* input, BLAKE2_State<word64, true>
   t0 = _mm_alignr_epi8(row4l, row4h, 8);
   t1 = _mm_alignr_epi8(row4h, row4l, 8);
   row4l = t1, row4h = t0;
-  
+
   b0 = _mm_unpacklo_epi64(m3, m7);
   b1 = _mm_alignr_epi8(m0, m5, 8);
 
@@ -3150,7 +3172,7 @@ static void BLAKE2_SSE4_Compress64(const byte* input, BLAKE2_State<word64, true>
   t0 = _mm_alignr_epi8(row4l, row4h, 8);
   t1 = _mm_alignr_epi8(row4h, row4l, 8);
   row4l = t1, row4h = t0;
-  
+
   b0 = _mm_unpacklo_epi64(m5, m4);
   b1 = _mm_unpackhi_epi64(m3, m0);
 
@@ -3228,7 +3250,7 @@ static void BLAKE2_SSE4_Compress64(const byte* input, BLAKE2_State<word64, true>
   t0 = _mm_alignr_epi8(row4l, row4h, 8);
   t1 = _mm_alignr_epi8(row4h, row4l, 8);
   row4l = t1, row4h = t0;
-  
+
   b0 = _mm_unpacklo_epi64(m0, m1);
   b1 = _mm_unpacklo_epi64(m2, m3);
 
@@ -3306,7 +3328,7 @@ static void BLAKE2_SSE4_Compress64(const byte* input, BLAKE2_State<word64, true>
   t0 = _mm_alignr_epi8(row4l, row4h, 8);
   t1 = _mm_alignr_epi8(row4h, row4l, 8);
   row4l = t1, row4h = t0;
-  
+
   b0 = _mm_unpacklo_epi64(m7, m2);
   b1 = _mm_unpackhi_epi64(m4, m6);
 
@@ -3384,7 +3406,7 @@ static void BLAKE2_SSE4_Compress64(const byte* input, BLAKE2_State<word64, true>
   t0 = _mm_alignr_epi8(row4l, row4h, 8);
   t1 = _mm_alignr_epi8(row4h, row4l, 8);
   row4l = t1, row4h = t0;
-  
+
   row1l = _mm_xor_si128(row3l, row1l);
   row1h = _mm_xor_si128(row3h, row1h);
   _mm_storeu_si128((__m128i *)(void*)(&state.h[0]), _mm_xor_si128(_mm_loadu_si128((const __m128i*)(const void*)(&state.h[0])), row1l));
@@ -3396,6 +3418,1621 @@ static void BLAKE2_SSE4_Compress64(const byte* input, BLAKE2_State<word64, true>
   _mm_storeu_si128((__m128i *)(void*)(&state.h[6]), _mm_xor_si128(_mm_loadu_si128((const __m128i*)(const void*)(&state.h[6])), row2h));
 }
 #endif  // CRYPTOPP_BOOL_SSE4_INTRINSICS_AVAILABLE
+
+#if CRYPTOPP_BOOL_NEON_INTRINSICS_AVAILABLE
+
+// Reverse words for ARM (use arguments to _mm_set_epi32 without reversing them).
+#define vld1q_u32_rev(x, a,b,c,d) d[1]=c[0],d[2]=b[0],d[3]=a[0]; x = vld1q_u32(d);
+
+// Keep things straight due to swapping. For a 128-bit vector, H64 denotes
+//   the high 64-bit vector, and L64 denotes the low 64-bit vector. The
+//   vectors are the same as returned by vget_high_u64 and vget_low_u64.
+static const int LANE_H64 = 1;
+static const int LANE_L64 = 0;
+
+static void BLAKE2_NEON_Compress32(const byte* input, BLAKE2_State<word32, false>& state)
+{
+  assert(IsAlignedOn(&state.h[0],GetAlignmentOf<uint32x4_t>()));
+  assert(IsAlignedOn(&state.h[4],GetAlignmentOf<uint32x4_t>()));
+  assert(IsAlignedOn(&state.t[0],GetAlignmentOf<uint32x4_t>()));
+
+  CRYPTOPP_ALIGN_DATA(16) uint32_t m0[4], m1[4], m2[4], m3[4], m4[4], m5[4], m6[4], m7[4];
+  CRYPTOPP_ALIGN_DATA(16) uint32_t m8[4], m9[4], m10[4], m11[4], m12[4], m13[4], m14[4], m15[4];
+
+  GetBlock<word32, LittleEndian, true> get(input);
+  get(m0[0])(m1[0])(m2[0])(m3[0])(m4[0])(m5[0])(m6[0])(m7[0])(m8[0])(m9[0])(m10[0])(m11[0])(m12[0])(m13[0])(m14[0])(m15[0]);
+
+  uint32x4_t row1,row2,row3,row4;
+  uint32x4_t buf1,buf2,buf3,buf4;
+  uint32x4_t ff0,ff1;
+
+  row1 = ff0 = vld1q_u32((const uint32_t*)&state.h[0]);
+  row2 = ff1 = vld1q_u32((const uint32_t*)&state.h[4]);
+  row3 = vld1q_u32((const uint32_t*)&BLAKE2S_IV(0));
+  row4 = veorq_u32(vld1q_u32((const uint32_t*)&BLAKE2S_IV(4)), vld1q_u32((const uint32_t*)&state.t[0]));
+
+  // buf1 = vld1q_u32(m6,m4,m2,m0);
+  vld1q_u32_rev(buf1, m6,m4,m2,m0);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf1),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,16),vshlq_n_u32(row4,16));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,12),vshlq_n_u32(row2,20));
+
+  // buf2 = vld1q_u32(m7,m5,m3,m1);
+  vld1q_u32_rev(buf2, m7,m5,m3,m1);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf2),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,8),vshlq_n_u32(row4,24));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,7),vshlq_n_u32(row2,25));
+
+  row4 = vextq_u32(row4,row4,3);
+  row3 = vcombine_u32(vget_high_u32(row3),vget_low_u32(row3));
+  row2 = vextq_u32(row2,row2,1);
+
+  // buf3 = vld1q_u32(m14,m12,m10,m8);
+  vld1q_u32_rev(buf3, m14,m12,m10,m8);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf3),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,16),vshlq_n_u32(row4,16));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,12),vshlq_n_u32(row2,20));
+
+  // buf4 = vld1q_u32(m15,m13,m11,m9);
+  vld1q_u32_rev(buf4, m15,m13,m11,m9);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf4),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,8),vshlq_n_u32(row4,24));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,7),vshlq_n_u32(row2,25));
+
+  row4 = vextq_u32(row4,row4,1);
+  row3 = vcombine_u32(vget_high_u32(row3),vget_low_u32(row3));
+  row2 = vextq_u32(row2,row2,3);
+
+  // buf1 = vld1q_u32(m13,m9,m4,m14);
+  vld1q_u32_rev(buf1, m13,m9,m4,m14);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf1),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,16),vshlq_n_u32(row4,16));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,12),vshlq_n_u32(row2,20));
+
+  // buf2 = vld1q_u32(m6,m15,m8,m10);
+  vld1q_u32_rev(buf2, m6,m15,m8,m10);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf2),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,8),vshlq_n_u32(row4,24));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,7),vshlq_n_u32(row2,25));
+
+  row4 = vextq_u32(row4,row4,3);
+  row3 = vcombine_u32(vget_high_u32(row3),vget_low_u32(row3));
+  row2 = vextq_u32(row2,row2,1);
+
+  // buf3 = vld1q_u32(m5,m11,m0,m1);
+  vld1q_u32_rev(buf3, m5,m11,m0,m1);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf3),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,16),vshlq_n_u32(row4,16));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,12),vshlq_n_u32(row2,20));
+
+  // buf4 = vld1q_u32(m3,m7,m2,m12);
+  vld1q_u32_rev(buf4, m3,m7,m2,m12);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf4),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,8),vshlq_n_u32(row4,24));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,7),vshlq_n_u32(row2,25));
+
+  row4 = vextq_u32(row4,row4,1);
+  row3 = vcombine_u32(vget_high_u32(row3),vget_low_u32(row3));
+  row2 = vextq_u32(row2,row2,3);
+
+  // buf1 = vld1q_u32(m15,m5,m12,m11);
+  vld1q_u32_rev(buf1, m15,m5,m12,m11);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf1),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,16),vshlq_n_u32(row4,16));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,12),vshlq_n_u32(row2,20));
+
+  // buf2 = vld1q_u32(m13,m2,m0,m8);
+  vld1q_u32_rev(buf2, m13,m2,m0,m8);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf2),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,8),vshlq_n_u32(row4,24));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,7),vshlq_n_u32(row2,25));
+
+  row4 = vextq_u32(row4,row4,3);
+  row3 = vcombine_u32(vget_high_u32(row3),vget_low_u32(row3));
+  row2 = vextq_u32(row2,row2,1);
+
+  // buf3 = vld1q_u32(m9,m7,m3,m10);
+  vld1q_u32_rev(buf3, m9,m7,m3,m10);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf3),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,16),vshlq_n_u32(row4,16));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,12),vshlq_n_u32(row2,20));
+
+  // buf4 = vld1q_u32(m4,m1,m6,m14);
+  vld1q_u32_rev(buf4, m4,m1,m6,m14);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf4),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,8),vshlq_n_u32(row4,24));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,7),vshlq_n_u32(row2,25));
+
+  row4 = vextq_u32(row4,row4,1);
+  row3 = vcombine_u32(vget_high_u32(row3),vget_low_u32(row3));
+  row2 = vextq_u32(row2,row2,3);
+
+  // buf1 = vld1q_u32(m11,m13,m3,m7);
+  vld1q_u32_rev(buf1, m11,m13,m3,m7);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf1),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,16),vshlq_n_u32(row4,16));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,12),vshlq_n_u32(row2,20));
+
+  // buf2 = vld1q_u32(m14,m12,m1,m9);
+  vld1q_u32_rev(buf2, m14,m12,m1,m9);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf2),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,8),vshlq_n_u32(row4,24));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,7),vshlq_n_u32(row2,25));
+
+  row4 = vextq_u32(row4,row4,3);
+  row3 = vcombine_u32(vget_high_u32(row3),vget_low_u32(row3));
+  row2 = vextq_u32(row2,row2,1);
+
+  // buf3 = vld1q_u32(m15,m4,m5,m2);
+  vld1q_u32_rev(buf3, m15,m4,m5,m2);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf3),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,16),vshlq_n_u32(row4,16));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,12),vshlq_n_u32(row2,20));
+
+  // buf4 = vld1q_u32(m8,m0,m10,m6);
+  vld1q_u32_rev(buf4, m8,m0,m10,m6);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf4),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,8),vshlq_n_u32(row4,24));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,7),vshlq_n_u32(row2,25));
+
+  row4 = vextq_u32(row4,row4,1);
+  row3 = vcombine_u32(vget_high_u32(row3),vget_low_u32(row3));
+  row2 = vextq_u32(row2,row2,3);
+
+  // buf1 = vld1q_u32(m10,m2,m5,m9);
+  vld1q_u32_rev(buf1, m10,m2,m5,m9);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf1),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,16),vshlq_n_u32(row4,16));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,12),vshlq_n_u32(row2,20));
+
+  // buf2 = vld1q_u32(m15,m4,m7,m0);
+  vld1q_u32_rev(buf2, m15,m4,m7,m0);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf2),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,8),vshlq_n_u32(row4,24));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,7),vshlq_n_u32(row2,25));
+
+  row4 = vextq_u32(row4,row4,3);
+  row3 = vcombine_u32(vget_high_u32(row3),vget_low_u32(row3));
+  row2 = vextq_u32(row2,row2,1);
+
+  // buf3 = vld1q_u32(m3,m6,m11,m14);
+  vld1q_u32_rev(buf3, m3,m6,m11,m14);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf3),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,16),vshlq_n_u32(row4,16));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,12),vshlq_n_u32(row2,20));
+
+  // buf4 = vld1q_u32(m13,m8,m12,m1);
+  vld1q_u32_rev(buf4, m13,m8,m12,m1);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf4),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,8),vshlq_n_u32(row4,24));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,7),vshlq_n_u32(row2,25));
+
+  row4 = vextq_u32(row4,row4,1);
+  row3 = vcombine_u32(vget_high_u32(row3),vget_low_u32(row3));
+  row2 = vextq_u32(row2,row2,3);
+
+  // buf1 = vld1q_u32(m8,m0,m6,m2);
+  vld1q_u32_rev(buf1, m8,m0,m6,m2);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf1),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,16),vshlq_n_u32(row4,16));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,12),vshlq_n_u32(row2,20));
+
+  // buf2 = vld1q_u32(m3,m11,m10,m12);
+  vld1q_u32_rev(buf2, m3,m11,m10,m12);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf2),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,8),vshlq_n_u32(row4,24));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,7),vshlq_n_u32(row2,25));
+
+  row4 = vextq_u32(row4,row4,3);
+  row3 = vcombine_u32(vget_high_u32(row3),vget_low_u32(row3));
+  row2 = vextq_u32(row2,row2,1);
+
+  // buf3 = vld1q_u32(m1,m15,m7,m4);
+  vld1q_u32_rev(buf3, m1,m15,m7,m4);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf3),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,16),vshlq_n_u32(row4,16));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,12),vshlq_n_u32(row2,20));
+
+  // buf4 = vld1q_u32(m9,m14,m5,m13);
+  vld1q_u32_rev(buf4, m9,m14,m5,m13);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf4),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,8),vshlq_n_u32(row4,24));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,7),vshlq_n_u32(row2,25));
+
+  row4 = vextq_u32(row4,row4,1);
+  row3 = vcombine_u32(vget_high_u32(row3),vget_low_u32(row3));
+  row2 = vextq_u32(row2,row2,3);
+
+  // buf1 = vld1q_u32(m4,m14,m1,m12);
+  vld1q_u32_rev(buf1, m4,m14,m1,m12);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf1),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,16),vshlq_n_u32(row4,16));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,12),vshlq_n_u32(row2,20));
+
+  // buf2 = vld1q_u32(m10,m13,m15,m5);
+  vld1q_u32_rev(buf2, m10,m13,m15,m5);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf2),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,8),vshlq_n_u32(row4,24));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,7),vshlq_n_u32(row2,25));
+
+  row4 = vextq_u32(row4,row4,3);
+  row3 = vcombine_u32(vget_high_u32(row3),vget_low_u32(row3));
+  row2 = vextq_u32(row2,row2,1);
+
+  // buf3 = vld1q_u32(m8,m9,m6,m0);
+  vld1q_u32_rev(buf3, m8,m9,m6,m0);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf3),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,16),vshlq_n_u32(row4,16));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,12),vshlq_n_u32(row2,20));
+
+  // buf4 = vld1q_u32(m11,m2,m3,m7);
+  vld1q_u32_rev(buf4, m11,m2,m3,m7);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf4),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,8),vshlq_n_u32(row4,24));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,7),vshlq_n_u32(row2,25));
+
+  row4 = vextq_u32(row4,row4,1);
+  row3 = vcombine_u32(vget_high_u32(row3),vget_low_u32(row3));
+  row2 = vextq_u32(row2,row2,3);
+
+  // buf1 = vld1q_u32(m3,m12,m7,m13);
+  vld1q_u32_rev(buf1, m3,m12,m7,m13);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf1),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,16),vshlq_n_u32(row4,16));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,12),vshlq_n_u32(row2,20));
+
+  // buf2 = vld1q_u32(m9,m1,m14,m11);
+  vld1q_u32_rev(buf2, m9,m1,m14,m11);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf2),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,8),vshlq_n_u32(row4,24));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,7),vshlq_n_u32(row2,25));
+
+  row4 = vextq_u32(row4,row4,3);
+  row3 = vcombine_u32(vget_high_u32(row3),vget_low_u32(row3));
+  row2 = vextq_u32(row2,row2,1);
+
+  // buf3 = vld1q_u32(m2,m8,m15,m5);
+  vld1q_u32_rev(buf3, m2,m8,m15,m5);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf3),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,16),vshlq_n_u32(row4,16));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,12),vshlq_n_u32(row2,20));
+
+  // buf4 = vld1q_u32(m10,m6,m4,m0);
+  vld1q_u32_rev(buf4, m10,m6,m4,m0);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf4),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,8),vshlq_n_u32(row4,24));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,7),vshlq_n_u32(row2,25));
+
+  row4 = vextq_u32(row4,row4,1);
+  row3 = vcombine_u32(vget_high_u32(row3),vget_low_u32(row3));
+  row2 = vextq_u32(row2,row2,3);
+
+  // buf1 = vld1q_u32(m0,m11,m14,m6);
+  vld1q_u32_rev(buf1, m0,m11,m14,m6);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf1),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,16),vshlq_n_u32(row4,16));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,12),vshlq_n_u32(row2,20));
+
+  // buf2 = vld1q_u32(m8,m3,m9,m15);
+  vld1q_u32_rev(buf2, m8,m3,m9,m15);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf2),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,8),vshlq_n_u32(row4,24));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,7),vshlq_n_u32(row2,25));
+
+  row4 = vextq_u32(row4,row4,3);
+  row3 = vcombine_u32(vget_high_u32(row3),vget_low_u32(row3));
+  row2 = vextq_u32(row2,row2,1);
+
+  // buf3 = vld1q_u32(m10,m1,m13,m12);
+  vld1q_u32_rev(buf3, m10,m1,m13,m12);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf3),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,16),vshlq_n_u32(row4,16));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,12),vshlq_n_u32(row2,20));
+
+  // buf4 = vld1q_u32(m5,m4,m7,m2);
+  vld1q_u32_rev(buf4, m5,m4,m7,m2);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf4),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,8),vshlq_n_u32(row4,24));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,7),vshlq_n_u32(row2,25));
+
+  row4 = vextq_u32(row4,row4,1);
+  row3 = vcombine_u32(vget_high_u32(row3),vget_low_u32(row3));
+  row2 = vextq_u32(row2,row2,3);
+
+  // buf1 = vld1q_u32(m1,m7,m8,m10);
+  vld1q_u32_rev(buf1, m1,m7,m8,m10);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf1),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,16),vshlq_n_u32(row4,16));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,12),vshlq_n_u32(row2,20));
+
+  // buf2 = vld1q_u32(m5,m6,m4,m2);
+  vld1q_u32_rev(buf2, m5,m6,m4,m2);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf2),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,8),vshlq_n_u32(row4,24));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,7),vshlq_n_u32(row2,25));
+
+  row4 = vextq_u32(row4,row4,3);
+  row3 = vcombine_u32(vget_high_u32(row3),vget_low_u32(row3));
+  row2 = vextq_u32(row2,row2,1);
+
+  // buf3 = vld1q_u32(m13,m3,m9,m15);
+  vld1q_u32_rev(buf3, m13,m3,m9,m15);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf3),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,16),vshlq_n_u32(row4,16));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,12),vshlq_n_u32(row2,20));
+
+  // buf4 = vld1q_u32(m0,m12,m14,m11);
+  vld1q_u32_rev(buf4, m0,m12,m14,m11);
+
+  row1 = vaddq_u32(vaddq_u32(row1,buf4),row2);
+  row4 = veorq_u32(row4,row1);
+  row4 = veorq_u32(vshrq_n_u32(row4,8),vshlq_n_u32(row4,24));
+  row3 = vaddq_u32(row3,row4);
+  row2 = veorq_u32(row2,row3);
+  row2 = veorq_u32(vshrq_n_u32(row2,7),vshlq_n_u32(row2,25));
+
+  row4 = vextq_u32(row4,row4,1);
+  row3 = vcombine_u32(vget_high_u32(row3),vget_low_u32(row3));
+  row2 = vextq_u32(row2,row2,3);
+
+  vst1q_u32((uint32_t*)&state.h[0],veorq_u32(ff0,veorq_u32(row1,row3)));
+  vst1q_u32((uint32_t*)&state.h[4],veorq_u32(ff1,veorq_u32(row2,row4)));
+}
+
+static void BLAKE2_NEON_Compress64(const byte* input, BLAKE2_State<word64, true>& state)
+{
+  assert(IsAlignedOn(input,GetAlignmentOf<uint8x16_t>()));
+  assert(IsAlignedOn(&state.h[0],GetAlignmentOf<uint64x2_t>()));
+  assert(IsAlignedOn(&state.h[4],GetAlignmentOf<uint64x2_t>()));
+  assert(IsAlignedOn(&state.t[0],GetAlignmentOf<uint64x2_t>()));
+
+  uint64x2_t m0m1,m2m3,m4m5,m6m7,m8m9,m10m11,m12m13,m14m15;
+
+    m0m1 = vreinterpretq_u64_u8(vld1q_u8(input+  0));
+    m2m3 = vreinterpretq_u64_u8(vld1q_u8(input+ 16));
+    m4m5 = vreinterpretq_u64_u8(vld1q_u8(input+ 32));
+    m6m7 = vreinterpretq_u64_u8(vld1q_u8(input+ 48));
+    m8m9 = vreinterpretq_u64_u8(vld1q_u8(input+ 64));
+  m10m11 = vreinterpretq_u64_u8(vld1q_u8(input+ 80));
+  m12m13 = vreinterpretq_u64_u8(vld1q_u8(input+ 96));
+  m14m15 = vreinterpretq_u64_u8(vld1q_u8(input+112));
+
+  uint64x2_t row1l, row1h, row2l, row2h;
+  uint64x2_t row3l, row3h, row4l, row4h;
+  uint64x2_t b0, b1, t0, t1;
+
+  row1l = vld1q_u64((const uint64_t *)&state.h[0]);
+  row1h = vld1q_u64((const uint64_t *)&state.h[2]);
+  row2l = vld1q_u64((const uint64_t *)&state.h[4]);
+  row2h = vld1q_u64((const uint64_t *)&state.h[6]);
+  row3l = vld1q_u64((const uint64_t *)&BLAKE2B_IV(0));
+  row3h = vld1q_u64((const uint64_t *)&BLAKE2B_IV(2));
+  row4l = veorq_u64(vld1q_u64((const uint64_t *)&BLAKE2B_IV(4)), vld1q_u64((const uint64_t*)&state.t[0]));
+  row4h = veorq_u64(vld1q_u64((const uint64_t *)&BLAKE2B_IV(6)), vld1q_u64((const uint64_t*)&state.f[0]));
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m0m1,LANE_L64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m2m3,LANE_L64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m4m5,LANE_L64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m6m7,LANE_L64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,32),vshlq_n_u64(row4l,32));
+  row4h = veorq_u64(vshrq_n_u64(row4h,32),vshlq_n_u64(row4h,32));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,24),vshlq_n_u64(row2l,40));
+  row2h = veorq_u64(vshrq_n_u64(row2h,24),vshlq_n_u64(row2h,40));
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m0m1,LANE_H64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m2m3,LANE_H64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m4m5,LANE_H64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m6m7,LANE_H64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,16),vshlq_n_u64(row4l,48));
+  row4h = veorq_u64(vshrq_n_u64(row4h,16),vshlq_n_u64(row4h,48));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,63),vshlq_n_u64(row2l,1));
+  row2h = veorq_u64(vshrq_n_u64(row2h,63),vshlq_n_u64(row2h,1));
+
+  t0 = row4l, t1 = row2l, row4l = row3l, row3l = row3h, row3h = row4l;
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_H64),row4l,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_L64),row4l,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_L64),row4h,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_H64),row4h,LANE_L64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2l,LANE_H64),row2l,LANE_L64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_L64),row2l,LANE_H64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_H64),row2h,LANE_L64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(t1,LANE_L64),row2h,LANE_H64);
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m8m9,LANE_L64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m10m11,LANE_L64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m12m13,LANE_L64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m14m15,LANE_L64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,32),vshlq_n_u64(row4l,32));
+  row4h = veorq_u64(vshrq_n_u64(row4h,32),vshlq_n_u64(row4h,32));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,24),vshlq_n_u64(row2l,40));
+  row2h = veorq_u64(vshrq_n_u64(row2h,24),vshlq_n_u64(row2h,40));
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m8m9,LANE_H64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m10m11,LANE_H64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m12m13,LANE_H64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m14m15,LANE_H64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,16),vshlq_n_u64(row4l,48));
+  row4h = veorq_u64(vshrq_n_u64(row4h,16),vshlq_n_u64(row4h,48));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,63),vshlq_n_u64(row2l,1));
+  row2h = veorq_u64(vshrq_n_u64(row2h,63),vshlq_n_u64(row2h,1));
+
+  t0 = row3l, row3l = row3h, row3h = t0, t0 = row2l, t1 = row4l;
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2l,LANE_L64),row2l,LANE_H64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_H64),row2l,LANE_L64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_L64),row2h,LANE_H64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_H64),row2h,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4l,LANE_H64),row4l,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_L64),row4l,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_H64),row4h,LANE_L64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(t1,LANE_L64),row4h,LANE_H64);
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m14m15,LANE_L64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m4m5,LANE_L64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m8m9,LANE_H64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m12m13,LANE_H64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,32),vshlq_n_u64(row4l,32));
+  row4h = veorq_u64(vshrq_n_u64(row4h,32),vshlq_n_u64(row4h,32));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,24),vshlq_n_u64(row2l,40));
+  row2h = veorq_u64(vshrq_n_u64(row2h,24),vshlq_n_u64(row2h,40));
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m10m11,LANE_L64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m8m9,LANE_L64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m14m15,LANE_H64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m6m7,LANE_L64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,16),vshlq_n_u64(row4l,48));
+  row4h = veorq_u64(vshrq_n_u64(row4h,16),vshlq_n_u64(row4h,48));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,63),vshlq_n_u64(row2l,1));
+  row2h = veorq_u64(vshrq_n_u64(row2h,63),vshlq_n_u64(row2h,1));
+
+  t0 = row4l, t1 = row2l, row4l = row3l, row3l = row3h, row3h = row4l;
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_H64),row4l,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_L64),row4l,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_L64),row4h,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_H64),row4h,LANE_L64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2l,LANE_H64),row2l,LANE_L64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_L64),row2l,LANE_H64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_H64),row2h,LANE_L64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(t1,LANE_L64),row2h,LANE_H64);
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m0m1,LANE_H64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m0m1,LANE_L64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m10m11,LANE_H64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m4m5,LANE_H64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,32),vshlq_n_u64(row4l,32));
+  row4h = veorq_u64(vshrq_n_u64(row4h,32),vshlq_n_u64(row4h,32));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,24),vshlq_n_u64(row2l,40));
+  row2h = veorq_u64(vshrq_n_u64(row2h,24),vshlq_n_u64(row2h,40));
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m12m13,LANE_L64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m2m3,LANE_L64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m6m7,LANE_H64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m2m3,LANE_H64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,16),vshlq_n_u64(row4l,48));
+  row4h = veorq_u64(vshrq_n_u64(row4h,16),vshlq_n_u64(row4h,48));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,63),vshlq_n_u64(row2l,1));
+  row2h = veorq_u64(vshrq_n_u64(row2h,63),vshlq_n_u64(row2h,1));
+
+  t0 = row3l, row3l = row3h, row3h = t0, t0 = row2l, t1 = row4l;
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2l,LANE_L64),row2l,LANE_H64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_H64),row2l,LANE_L64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_L64),row2h,LANE_H64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_H64),row2h,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4l,LANE_H64),row4l,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_L64),row4l,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_H64),row4h,LANE_L64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(t1,LANE_L64),row4h,LANE_H64);
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m10m11,LANE_H64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m12m13,LANE_L64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m4m5,LANE_H64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m14m15,LANE_H64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,32),vshlq_n_u64(row4l,32));
+  row4h = veorq_u64(vshrq_n_u64(row4h,32),vshlq_n_u64(row4h,32));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,24),vshlq_n_u64(row2l,40));
+  row2h = veorq_u64(vshrq_n_u64(row2h,24),vshlq_n_u64(row2h,40));
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m8m9,LANE_L64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m0m1,LANE_L64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m2m3,LANE_L64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m12m13,LANE_H64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,16),vshlq_n_u64(row4l,48));
+  row4h = veorq_u64(vshrq_n_u64(row4h,16),vshlq_n_u64(row4h,48));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,63),vshlq_n_u64(row2l,1));
+  row2h = veorq_u64(vshrq_n_u64(row2h,63),vshlq_n_u64(row2h,1));
+
+  t0 = row4l, t1 = row2l, row4l = row3l, row3l = row3h, row3h = row4l;
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_H64),row4l,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_L64),row4l,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_L64),row4h,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_H64),row4h,LANE_L64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2l,LANE_H64),row2l,LANE_L64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_L64),row2l,LANE_H64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_H64),row2h,LANE_L64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(t1,LANE_L64),row2h,LANE_H64);
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m10m11,LANE_L64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m2m3,LANE_H64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m6m7,LANE_H64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m8m9,LANE_H64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,32),vshlq_n_u64(row4l,32));
+  row4h = veorq_u64(vshrq_n_u64(row4h,32),vshlq_n_u64(row4h,32));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,24),vshlq_n_u64(row2l,40));
+  row2h = veorq_u64(vshrq_n_u64(row2h,24),vshlq_n_u64(row2h,40));
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m14m15,LANE_L64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m6m7,LANE_L64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m0m1,LANE_H64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m4m5,LANE_L64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,16),vshlq_n_u64(row4l,48));
+  row4h = veorq_u64(vshrq_n_u64(row4h,16),vshlq_n_u64(row4h,48));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,63),vshlq_n_u64(row2l,1));
+  row2h = veorq_u64(vshrq_n_u64(row2h,63),vshlq_n_u64(row2h,1));
+
+  t0 = row3l, row3l = row3h, row3h = t0, t0 = row2l, t1 = row4l;
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2l,LANE_L64),row2l,LANE_H64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_H64),row2l,LANE_L64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_L64),row2h,LANE_H64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_H64),row2h,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4l,LANE_H64),row4l,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_L64),row4l,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_H64),row4h,LANE_L64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(t1,LANE_L64),row4h,LANE_H64);
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m6m7,LANE_H64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m2m3,LANE_H64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m12m13,LANE_H64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m10m11,LANE_H64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,32),vshlq_n_u64(row4l,32));
+  row4h = veorq_u64(vshrq_n_u64(row4h,32),vshlq_n_u64(row4h,32));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,24),vshlq_n_u64(row2l,40));
+  row2h = veorq_u64(vshrq_n_u64(row2h,24),vshlq_n_u64(row2h,40));
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m8m9,LANE_H64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m0m1,LANE_H64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m12m13,LANE_L64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m14m15,LANE_L64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,16),vshlq_n_u64(row4l,48));
+  row4h = veorq_u64(vshrq_n_u64(row4h,16),vshlq_n_u64(row4h,48));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,63),vshlq_n_u64(row2l,1));
+  row2h = veorq_u64(vshrq_n_u64(row2h,63),vshlq_n_u64(row2h,1));
+
+  t0 = row4l, t1 = row2l, row4l = row3l, row3l = row3h, row3h = row4l;
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_H64),row4l,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_L64),row4l,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_L64),row4h,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_H64),row4h,LANE_L64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2l,LANE_H64),row2l,LANE_L64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_L64),row2l,LANE_H64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_H64),row2h,LANE_L64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(t1,LANE_L64),row2h,LANE_H64);
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m2m3,LANE_L64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m4m5,LANE_H64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m4m5,LANE_L64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m14m15,LANE_H64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,32),vshlq_n_u64(row4l,32));
+  row4h = veorq_u64(vshrq_n_u64(row4h,32),vshlq_n_u64(row4h,32));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,24),vshlq_n_u64(row2l,40));
+  row2h = veorq_u64(vshrq_n_u64(row2h,24),vshlq_n_u64(row2h,40));
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m6m7,LANE_L64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m10m11,LANE_L64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m0m1,LANE_L64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m8m9,LANE_L64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,16),vshlq_n_u64(row4l,48));
+  row4h = veorq_u64(vshrq_n_u64(row4h,16),vshlq_n_u64(row4h,48));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,63),vshlq_n_u64(row2l,1));
+  row2h = veorq_u64(vshrq_n_u64(row2h,63),vshlq_n_u64(row2h,1));
+
+  t0 = row3l, row3l = row3h, row3h = t0, t0 = row2l, t1 = row4l;
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2l,LANE_L64),row2l,LANE_H64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_H64),row2l,LANE_L64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_L64),row2h,LANE_H64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_H64),row2h,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4l,LANE_H64),row4l,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_L64),row4l,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_H64),row4h,LANE_L64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(t1,LANE_L64),row4h,LANE_H64);
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m8m9,LANE_H64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m4m5,LANE_H64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m2m3,LANE_L64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m10m11,LANE_L64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,32),vshlq_n_u64(row4l,32));
+  row4h = veorq_u64(vshrq_n_u64(row4h,32),vshlq_n_u64(row4h,32));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,24),vshlq_n_u64(row2l,40));
+  row2h = veorq_u64(vshrq_n_u64(row2h,24),vshlq_n_u64(row2h,40));
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m0m1,LANE_L64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m6m7,LANE_H64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m4m5,LANE_L64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m14m15,LANE_H64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,16),vshlq_n_u64(row4l,48));
+  row4h = veorq_u64(vshrq_n_u64(row4h,16),vshlq_n_u64(row4h,48));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,63),vshlq_n_u64(row2l,1));
+  row2h = veorq_u64(vshrq_n_u64(row2h,63),vshlq_n_u64(row2h,1));
+
+  t0 = row4l, t1 = row2l, row4l = row3l, row3l = row3h, row3h = row4l;
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_H64),row4l,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_L64),row4l,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_L64),row4h,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_H64),row4h,LANE_L64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2l,LANE_H64),row2l,LANE_L64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_L64),row2l,LANE_H64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_H64),row2h,LANE_L64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(t1,LANE_L64),row2h,LANE_H64);
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m14m15,LANE_L64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m10m11,LANE_H64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m6m7,LANE_L64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m2m3,LANE_H64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,32),vshlq_n_u64(row4l,32));
+  row4h = veorq_u64(vshrq_n_u64(row4h,32),vshlq_n_u64(row4h,32));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,24),vshlq_n_u64(row2l,40));
+  row2h = veorq_u64(vshrq_n_u64(row2h,24),vshlq_n_u64(row2h,40));
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m0m1,LANE_H64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m12m13,LANE_L64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m8m9,LANE_L64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m12m13,LANE_H64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,16),vshlq_n_u64(row4l,48));
+  row4h = veorq_u64(vshrq_n_u64(row4h,16),vshlq_n_u64(row4h,48));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,63),vshlq_n_u64(row2l,1));
+  row2h = veorq_u64(vshrq_n_u64(row2h,63),vshlq_n_u64(row2h,1));
+
+  t0 = row3l, row3l = row3h, row3h = t0, t0 = row2l, t1 = row4l;
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2l,LANE_L64),row2l,LANE_H64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_H64),row2l,LANE_L64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_L64),row2h,LANE_H64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_H64),row2h,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4l,LANE_H64),row4l,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_L64),row4l,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_H64),row4h,LANE_L64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(t1,LANE_L64),row4h,LANE_H64);
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m2m3,LANE_L64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m6m7,LANE_L64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m0m1,LANE_L64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m8m9,LANE_L64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,32),vshlq_n_u64(row4l,32));
+  row4h = veorq_u64(vshrq_n_u64(row4h,32),vshlq_n_u64(row4h,32));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,24),vshlq_n_u64(row2l,40));
+  row2h = veorq_u64(vshrq_n_u64(row2h,24),vshlq_n_u64(row2h,40));
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m12m13,LANE_L64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m10m11,LANE_L64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m10m11,LANE_H64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m2m3,LANE_H64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,16),vshlq_n_u64(row4l,48));
+  row4h = veorq_u64(vshrq_n_u64(row4h,16),vshlq_n_u64(row4h,48));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,63),vshlq_n_u64(row2l,1));
+  row2h = veorq_u64(vshrq_n_u64(row2h,63),vshlq_n_u64(row2h,1));
+
+  t0 = row4l, t1 = row2l, row4l = row3l, row3l = row3h, row3h = row4l;
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_H64),row4l,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_L64),row4l,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_L64),row4h,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_H64),row4h,LANE_L64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2l,LANE_H64),row2l,LANE_L64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_L64),row2l,LANE_H64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_H64),row2h,LANE_L64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(t1,LANE_L64),row2h,LANE_H64);
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m4m5,LANE_L64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m6m7,LANE_H64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m14m15,LANE_H64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m0m1,LANE_H64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,32),vshlq_n_u64(row4l,32));
+  row4h = veorq_u64(vshrq_n_u64(row4h,32),vshlq_n_u64(row4h,32));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,24),vshlq_n_u64(row2l,40));
+  row2h = veorq_u64(vshrq_n_u64(row2h,24),vshlq_n_u64(row2h,40));
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m12m13,LANE_H64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m4m5,LANE_H64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m14m15,LANE_L64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m8m9,LANE_H64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,16),vshlq_n_u64(row4l,48));
+  row4h = veorq_u64(vshrq_n_u64(row4h,16),vshlq_n_u64(row4h,48));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,63),vshlq_n_u64(row2l,1));
+  row2h = veorq_u64(vshrq_n_u64(row2h,63),vshlq_n_u64(row2h,1));
+
+  t0 = row3l, row3l = row3h, row3h = t0, t0 = row2l, t1 = row4l;
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2l,LANE_L64),row2l,LANE_H64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_H64),row2l,LANE_L64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_L64),row2h,LANE_H64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_H64),row2h,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4l,LANE_H64),row4l,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_L64),row4l,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_H64),row4h,LANE_L64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(t1,LANE_L64),row4h,LANE_H64);
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m12m13,LANE_L64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m0m1,LANE_H64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m14m15,LANE_L64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m4m5,LANE_L64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,32),vshlq_n_u64(row4l,32));
+  row4h = veorq_u64(vshrq_n_u64(row4h,32),vshlq_n_u64(row4h,32));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,24),vshlq_n_u64(row2l,40));
+  row2h = veorq_u64(vshrq_n_u64(row2h,24),vshlq_n_u64(row2h,40));
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m4m5,LANE_H64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m14m15,LANE_H64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m12m13,LANE_H64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m10m11,LANE_L64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,16),vshlq_n_u64(row4l,48));
+  row4h = veorq_u64(vshrq_n_u64(row4h,16),vshlq_n_u64(row4h,48));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,63),vshlq_n_u64(row2l,1));
+  row2h = veorq_u64(vshrq_n_u64(row2h,63),vshlq_n_u64(row2h,1));
+
+  t0 = row4l, t1 = row2l, row4l = row3l, row3l = row3h, row3h = row4l;
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_H64),row4l,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_L64),row4l,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_L64),row4h,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_H64),row4h,LANE_L64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2l,LANE_H64),row2l,LANE_L64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_L64),row2l,LANE_H64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_H64),row2h,LANE_L64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(t1,LANE_L64),row2h,LANE_H64);
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m0m1,LANE_L64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m6m7,LANE_L64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m8m9,LANE_H64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m8m9,LANE_L64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,32),vshlq_n_u64(row4l,32));
+  row4h = veorq_u64(vshrq_n_u64(row4h,32),vshlq_n_u64(row4h,32));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,24),vshlq_n_u64(row2l,40));
+  row2h = veorq_u64(vshrq_n_u64(row2h,24),vshlq_n_u64(row2h,40));
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m6m7,LANE_H64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m2m3,LANE_H64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m2m3,LANE_L64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m10m11,LANE_H64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,16),vshlq_n_u64(row4l,48));
+  row4h = veorq_u64(vshrq_n_u64(row4h,16),vshlq_n_u64(row4h,48));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,63),vshlq_n_u64(row2l,1));
+  row2h = veorq_u64(vshrq_n_u64(row2h,63),vshlq_n_u64(row2h,1));
+
+  t0 = row3l, row3l = row3h, row3h = t0, t0 = row2l, t1 = row4l;
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2l,LANE_L64),row2l,LANE_H64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_H64),row2l,LANE_L64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_L64),row2h,LANE_H64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_H64),row2h,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4l,LANE_H64),row4l,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_L64),row4l,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_H64),row4h,LANE_L64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(t1,LANE_L64),row4h,LANE_H64);
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m12m13,LANE_H64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m6m7,LANE_H64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m12m13,LANE_L64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m2m3,LANE_H64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,32),vshlq_n_u64(row4l,32));
+  row4h = veorq_u64(vshrq_n_u64(row4h,32),vshlq_n_u64(row4h,32));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,24),vshlq_n_u64(row2l,40));
+  row2h = veorq_u64(vshrq_n_u64(row2h,24),vshlq_n_u64(row2h,40));
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m10m11,LANE_H64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m14m15,LANE_L64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m0m1,LANE_H64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m8m9,LANE_H64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,16),vshlq_n_u64(row4l,48));
+  row4h = veorq_u64(vshrq_n_u64(row4h,16),vshlq_n_u64(row4h,48));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,63),vshlq_n_u64(row2l,1));
+  row2h = veorq_u64(vshrq_n_u64(row2h,63),vshlq_n_u64(row2h,1));
+
+  t0 = row4l, t1 = row2l, row4l = row3l, row3l = row3h, row3h = row4l;
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_H64),row4l,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_L64),row4l,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_L64),row4h,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_H64),row4h,LANE_L64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2l,LANE_H64),row2l,LANE_L64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_L64),row2l,LANE_H64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_H64),row2h,LANE_L64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(t1,LANE_L64),row2h,LANE_H64);
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m4m5,LANE_H64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m14m15,LANE_H64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m8m9,LANE_L64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m2m3,LANE_L64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,32),vshlq_n_u64(row4l,32));
+  row4h = veorq_u64(vshrq_n_u64(row4h,32),vshlq_n_u64(row4h,32));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,24),vshlq_n_u64(row2l,40));
+  row2h = veorq_u64(vshrq_n_u64(row2h,24),vshlq_n_u64(row2h,40));
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m0m1,LANE_L64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m4m5,LANE_L64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m6m7,LANE_L64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m10m11,LANE_L64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,16),vshlq_n_u64(row4l,48));
+  row4h = veorq_u64(vshrq_n_u64(row4h,16),vshlq_n_u64(row4h,48));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,63),vshlq_n_u64(row2l,1));
+  row2h = veorq_u64(vshrq_n_u64(row2h,63),vshlq_n_u64(row2h,1));
+
+  t0 = row3l, row3l = row3h, row3h = t0, t0 = row2l, t1 = row4l;
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2l,LANE_L64),row2l,LANE_H64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_H64),row2l,LANE_L64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_L64),row2h,LANE_H64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_H64),row2h,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4l,LANE_H64),row4l,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_L64),row4l,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_H64),row4h,LANE_L64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(t1,LANE_L64),row4h,LANE_H64);
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m6m7,LANE_L64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m14m15,LANE_L64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m10m11,LANE_H64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m0m1,LANE_L64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,32),vshlq_n_u64(row4l,32));
+  row4h = veorq_u64(vshrq_n_u64(row4h,32),vshlq_n_u64(row4h,32));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,24),vshlq_n_u64(row2l,40));
+  row2h = veorq_u64(vshrq_n_u64(row2h,24),vshlq_n_u64(row2h,40));
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m14m15,LANE_H64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m8m9,LANE_H64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m2m3,LANE_H64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m8m9,LANE_L64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,16),vshlq_n_u64(row4l,48));
+  row4h = veorq_u64(vshrq_n_u64(row4h,16),vshlq_n_u64(row4h,48));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,63),vshlq_n_u64(row2l,1));
+  row2h = veorq_u64(vshrq_n_u64(row2h,63),vshlq_n_u64(row2h,1));
+
+  t0 = row4l, t1 = row2l, row4l = row3l, row3l = row3h, row3h = row4l;
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_H64),row4l,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_L64),row4l,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_L64),row4h,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_H64),row4h,LANE_L64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2l,LANE_H64),row2l,LANE_L64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_L64),row2l,LANE_H64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_H64),row2h,LANE_L64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(t1,LANE_L64),row2h,LANE_H64);
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m12m13,LANE_L64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m12m13,LANE_H64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m0m1,LANE_H64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m10m11,LANE_L64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,32),vshlq_n_u64(row4l,32));
+  row4h = veorq_u64(vshrq_n_u64(row4h,32),vshlq_n_u64(row4h,32));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,24),vshlq_n_u64(row2l,40));
+  row2h = veorq_u64(vshrq_n_u64(row2h,24),vshlq_n_u64(row2h,40));
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m2m3,LANE_L64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m6m7,LANE_H64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m4m5,LANE_L64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m4m5,LANE_H64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,16),vshlq_n_u64(row4l,48));
+  row4h = veorq_u64(vshrq_n_u64(row4h,16),vshlq_n_u64(row4h,48));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,63),vshlq_n_u64(row2l,1));
+  row2h = veorq_u64(vshrq_n_u64(row2h,63),vshlq_n_u64(row2h,1));
+
+  t0 = row3l, row3l = row3h, row3h = t0, t0 = row2l, t1 = row4l;
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2l,LANE_L64),row2l,LANE_H64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_H64),row2l,LANE_L64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_L64),row2h,LANE_H64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_H64),row2h,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4l,LANE_H64),row4l,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_L64),row4l,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_H64),row4h,LANE_L64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(t1,LANE_L64),row4h,LANE_H64);
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m10m11,LANE_L64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m8m9,LANE_L64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m6m7,LANE_H64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m0m1,LANE_H64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,32),vshlq_n_u64(row4l,32));
+  row4h = veorq_u64(vshrq_n_u64(row4h,32),vshlq_n_u64(row4h,32));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,24),vshlq_n_u64(row2l,40));
+  row2h = veorq_u64(vshrq_n_u64(row2h,24),vshlq_n_u64(row2h,40));
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m2m3,LANE_L64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m4m5,LANE_L64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m6m7,LANE_L64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m4m5,LANE_H64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,16),vshlq_n_u64(row4l,48));
+  row4h = veorq_u64(vshrq_n_u64(row4h,16),vshlq_n_u64(row4h,48));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,63),vshlq_n_u64(row2l,1));
+  row2h = veorq_u64(vshrq_n_u64(row2h,63),vshlq_n_u64(row2h,1));
+
+  t0 = row4l, t1 = row2l, row4l = row3l, row3l = row3h, row3h = row4l;
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_H64),row4l,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_L64),row4l,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_L64),row4h,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_H64),row4h,LANE_L64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2l,LANE_H64),row2l,LANE_L64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_L64),row2l,LANE_H64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_H64),row2h,LANE_L64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(t1,LANE_L64),row2h,LANE_H64);
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m14m15,LANE_H64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m8m9,LANE_H64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m2m3,LANE_H64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m12m13,LANE_H64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,32),vshlq_n_u64(row4l,32));
+  row4h = veorq_u64(vshrq_n_u64(row4h,32),vshlq_n_u64(row4h,32));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,24),vshlq_n_u64(row2l,40));
+  row2h = veorq_u64(vshrq_n_u64(row2h,24),vshlq_n_u64(row2h,40));
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m10m11,LANE_H64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m14m15,LANE_L64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m12m13,LANE_L64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m0m1,LANE_L64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,16),vshlq_n_u64(row4l,48));
+  row4h = veorq_u64(vshrq_n_u64(row4h,16),vshlq_n_u64(row4h,48));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,63),vshlq_n_u64(row2l,1));
+  row2h = veorq_u64(vshrq_n_u64(row2h,63),vshlq_n_u64(row2h,1));
+
+  t0 = row3l, row3l = row3h, row3h = t0, t0 = row2l, t1 = row4l;
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2l,LANE_L64),row2l,LANE_H64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_H64),row2l,LANE_L64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_L64),row2h,LANE_H64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_H64),row2h,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4l,LANE_H64),row4l,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_L64),row4l,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_H64),row4h,LANE_L64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(t1,LANE_L64),row4h,LANE_H64);
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m0m1,LANE_L64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m2m3,LANE_L64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m4m5,LANE_L64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m6m7,LANE_L64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,32),vshlq_n_u64(row4l,32));
+  row4h = veorq_u64(vshrq_n_u64(row4h,32),vshlq_n_u64(row4h,32));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,24),vshlq_n_u64(row2l,40));
+  row2h = veorq_u64(vshrq_n_u64(row2h,24),vshlq_n_u64(row2h,40));
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m0m1,LANE_H64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m2m3,LANE_H64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m4m5,LANE_H64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m6m7,LANE_H64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,16),vshlq_n_u64(row4l,48));
+  row4h = veorq_u64(vshrq_n_u64(row4h,16),vshlq_n_u64(row4h,48));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,63),vshlq_n_u64(row2l,1));
+  row2h = veorq_u64(vshrq_n_u64(row2h,63),vshlq_n_u64(row2h,1));
+
+  t0 = row4l, t1 = row2l, row4l = row3l, row3l = row3h, row3h = row4l;
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_H64),row4l,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_L64),row4l,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_L64),row4h,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_H64),row4h,LANE_L64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2l,LANE_H64),row2l,LANE_L64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_L64),row2l,LANE_H64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_H64),row2h,LANE_L64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(t1,LANE_L64),row2h,LANE_H64);
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m8m9,LANE_L64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m10m11,LANE_L64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m12m13,LANE_L64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m14m15,LANE_L64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,32),vshlq_n_u64(row4l,32));
+  row4h = veorq_u64(vshrq_n_u64(row4h,32),vshlq_n_u64(row4h,32));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,24),vshlq_n_u64(row2l,40));
+  row2h = veorq_u64(vshrq_n_u64(row2h,24),vshlq_n_u64(row2h,40));
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m8m9,LANE_H64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m10m11,LANE_H64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m12m13,LANE_H64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m14m15,LANE_H64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,16),vshlq_n_u64(row4l,48));
+  row4h = veorq_u64(vshrq_n_u64(row4h,16),vshlq_n_u64(row4h,48));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,63),vshlq_n_u64(row2l,1));
+  row2h = veorq_u64(vshrq_n_u64(row2h,63),vshlq_n_u64(row2h,1));
+
+  t0 = row3l, row3l = row3h, row3h = t0, t0 = row2l, t1 = row4l;
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2l,LANE_L64),row2l,LANE_H64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_H64),row2l,LANE_L64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_L64),row2h,LANE_H64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_H64),row2h,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4l,LANE_H64),row4l,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_L64),row4l,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_H64),row4h,LANE_L64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(t1,LANE_L64),row4h,LANE_H64);
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m14m15,LANE_L64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m4m5,LANE_L64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m8m9,LANE_H64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m12m13,LANE_H64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,32),vshlq_n_u64(row4l,32));
+  row4h = veorq_u64(vshrq_n_u64(row4h,32),vshlq_n_u64(row4h,32));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,24),vshlq_n_u64(row2l,40));
+  row2h = veorq_u64(vshrq_n_u64(row2h,24),vshlq_n_u64(row2h,40));
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m10m11,LANE_L64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m8m9,LANE_L64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m14m15,LANE_H64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m6m7,LANE_L64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,16),vshlq_n_u64(row4l,48));
+  row4h = veorq_u64(vshrq_n_u64(row4h,16),vshlq_n_u64(row4h,48));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,63),vshlq_n_u64(row2l,1));
+  row2h = veorq_u64(vshrq_n_u64(row2h,63),vshlq_n_u64(row2h,1));
+
+  t0 = row4l, t1 = row2l, row4l = row3l, row3l = row3h, row3h = row4l;
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_H64),row4l,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_L64),row4l,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_L64),row4h,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_H64),row4h,LANE_L64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2l,LANE_H64),row2l,LANE_L64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_L64),row2l,LANE_H64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_H64),row2h,LANE_L64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(t1,LANE_L64),row2h,LANE_H64);
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m0m1,LANE_H64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m0m1,LANE_L64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m10m11,LANE_H64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m4m5,LANE_H64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,32),vshlq_n_u64(row4l,32));
+  row4h = veorq_u64(vshrq_n_u64(row4h,32),vshlq_n_u64(row4h,32));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,24),vshlq_n_u64(row2l,40));
+  row2h = veorq_u64(vshrq_n_u64(row2h,24),vshlq_n_u64(row2h,40));
+
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m12m13,LANE_L64),b0,LANE_L64);
+  b0 = vsetq_lane_u64(vgetq_lane_u64(m2m3,LANE_L64),b0,LANE_H64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m6m7,LANE_H64),b1,LANE_L64);
+  b1 = vsetq_lane_u64(vgetq_lane_u64(m2m3,LANE_H64),b1,LANE_H64);
+  row1l = vaddq_u64(vaddq_u64(row1l, b0), row2l);
+  row1h = vaddq_u64(vaddq_u64(row1h, b1), row2h);
+  row4l = veorq_u64(row4l, row1l);
+  row4h = veorq_u64(row4h, row1h);
+  row4l = veorq_u64(vshrq_n_u64(row4l,16),vshlq_n_u64(row4l,48));
+  row4h = veorq_u64(vshrq_n_u64(row4h,16),vshlq_n_u64(row4h,48));
+  row3l = vaddq_u64(row3l, row4l);
+  row3h = vaddq_u64(row3h, row4h);
+  row2l = veorq_u64(row2l, row3l);
+  row2h = veorq_u64(row2h, row3h);
+  row2l = veorq_u64(vshrq_n_u64(row2l,63),vshlq_n_u64(row2l,1));
+  row2h = veorq_u64(vshrq_n_u64(row2h,63),vshlq_n_u64(row2h,1));
+
+  t0 = row3l, row3l = row3h, row3h = t0, t0 = row2l, t1 = row4l;
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2l,LANE_L64),row2l,LANE_H64);
+  row2l = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_H64),row2l,LANE_L64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(row2h,LANE_L64),row2h,LANE_H64);
+  row2h = vsetq_lane_u64(vgetq_lane_u64(t0,LANE_H64),row2h,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4l,LANE_H64),row4l,LANE_L64);
+  row4l = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_L64),row4l,LANE_H64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(row4h,LANE_H64),row4h,LANE_L64);
+  row4h = vsetq_lane_u64(vgetq_lane_u64(t1,LANE_L64),row4h,LANE_H64);
+
+  row1l = veorq_u64(row3l, row1l);
+  row1h = veorq_u64(row3h, row1h);
+  vst1q_u64((uint64_t*)&state.h[0], veorq_u64(vld1q_u64((const uint64_t*)&state.h[0]), row1l));
+  vst1q_u64((uint64_t*)&state.h[2], veorq_u64(vld1q_u64((const uint64_t*)&state.h[2]), row1h));
+
+  row2l = veorq_u64(row4l, row2l);
+  row2h = veorq_u64(row4h, row2h);
+  vst1q_u64((uint64_t*)&state.h[4], veorq_u64(vld1q_u64((const uint64_t*)&state.h[4]), row2l));
+  vst1q_u64((uint64_t*)&state.h[6], veorq_u64(vld1q_u64((const uint64_t*)&state.h[6]), row2h));
+}
+#endif  // CRYPTOPP_BOOL_NEON_INTRINSICS_AVAILABLE
 
 template class BLAKE2_Base<word32, false>;
 template class BLAKE2_Base<word64, true>;
