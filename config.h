@@ -453,33 +453,27 @@ NAMESPACE_END
 #endif
 
 // Requires ARMv7 and ACLE 1.0. Testing shows ARMv7 is really ARMv7a under most toolchains.
-#if !defined(CRYPTOPP_BOOL_NEON_INTRINSICS_AVAILABLE)
-# if (CRYPTOPP_BOOL_ARM32 || CRYPTOPP_BOOL_ARM64) && ((CRYPTOPP_GCC_VERSION >= 40400) || (CRYPTOPP_CLANG_VERSION >= 20800) || (CRYPTOPP_APPLE_CLANG_VERSION >= 60000) || (CRYPTOPP_MSC_VERSION >= 1700))
-#  if defined(__ARM_NEON__) || defined(__ARM_NEON) || defined(_M_ARM)
-#   define CRYPTOPP_BOOL_NEON_INTRINSICS_AVAILABLE 1
-#  endif
+#if !defined(CRYPTOPP_BOOL_NEON_INTRINSICS_AVAILABLE) && !defined(CRYPTOPP_DISABLE_ASM)
+# if defined(__ARM_NEON__) || defined(__ARM_NEON) || defined(_M_ARM)
+#  define CRYPTOPP_BOOL_NEON_INTRINSICS_AVAILABLE 1
 # endif
 #endif
 
 // Requires ARMv8 and ACLE 2.0.
 // Microsoft plans to support ARM-64, but its not clear how to detect it.
 // TODO: Add MSC_VER and ARM-64 platform define when available
-#if !defined(CRYPTOPP_BOOL_ARM_CRC32_INTRINSICS_AVAILABLE)
-# if (CRYPTOPP_BOOL_ARM32 || CRYPTOPP_BOOL_ARM64) && ((CRYPTOPP_GCC_VERSION >= 40400) || (CRYPTOPP_CLANG_VERSION >= 20800) || (CRYPTOPP_APPLE_CLANG_VERSION >= 60000) || (CRYPTOPP_MSC_VERSION >= 2000))
-#  if defined(__ARM_FEATURE_CRC32) || defined(_M_ARM64)
-#   define CRYPTOPP_BOOL_ARM_CRC32_INTRINSICS_AVAILABLE 1
-#  endif
+#if !defined(CRYPTOPP_BOOL_ARM_CRC32_INTRINSICS_AVAILABLE) && !defined(CRYPTOPP_DISABLE_ASM)
+# if defined(__ARM_FEATURE_CRC32) || defined(_M_ARM64)
+#  define CRYPTOPP_BOOL_ARM_CRC32_INTRINSICS_AVAILABLE 1
 # endif
 #endif
 
 // Requires ARMv8 and ACLE 2.0.
 // Microsoft plans to support ARM-64, but its not clear how to detect it.
 // TODO: Add MSC_VER and ARM-64 platform define when available
-#if !defined(CRYPTOPP_BOOL_ARM_CRYPTO_INTRINSICS_AVAILABLE)
-# if (CRYPTOPP_BOOL_ARM32 || CRYPTOPP_BOOL_ARM64) && ((CRYPTOPP_GCC_VERSION >= 40400) || (CRYPTOPP_CLANG_VERSION >= 20800) || (CRYPTOPP_APPLE_CLANG_VERSION >= 60000) || (CRYPTOPP_MSC_VERSION >= 2000))
-#  if defined(__ARM_FEATURE_CRYPTO) || defined(_M_ARM64)
-#   define CRYPTOPP_BOOL_ARM_CRYPTO_INTRINSICS_AVAILABLE 1
-#  endif
+#if !defined(CRYPTOPP_BOOL_ARM_CRYPTO_INTRINSICS_AVAILABLE) && !defined(CRYPTOPP_DISABLE_ASM)
+# if defined(__ARM_FEATURE_CRYPTO) || defined(_M_ARM64)
+#  define CRYPTOPP_BOOL_ARM_CRYPTO_INTRINSICS_AVAILABLE 1
 # endif
 #endif
 
@@ -559,6 +553,8 @@ NAMESPACE_END
 	#define CRYPTOPP_BOOL_ARM32 0
 #endif
 
+// Microsoft plans to support ARM-64, but its not clear how to detect it.
+// TODO: Add MSC_VER and ARM-64 platform define when available
 #if defined(__arm64__) || defined(__aarch64__) || defined(_M_ARM64)
 	#define CRYPTOPP_BOOL_ARM64 1
 #else
@@ -763,20 +759,7 @@ NAMESPACE_END
 #  define CRYPTOPP_CXX11_ATOMICS 1
 #endif // atomics
 
-// atomics: MS at VS2012 (17.00); GCC at 4.4; Clang at 3.1/3.2; and Intel 13.0.
-#if (CRYPTOPP_MSC_VERSION >= 1700)
-#  define CRYPTOPP_CXX11_ATOMICS 1
-#elif defined(__INTEL_COMPILER) && (__INTEL_COMPILER >= 1300)
-#  define CRYPTOPP_CXX11_ATOMICS 1
-#elif defined(__clang__)
-#  if __has_feature(cxx_atomic)
-#    define CRYPTOPP_CXX11_ATOMICS 1
-#  endif
-#elif (CRYPTOPP_GCC_VERSION >= 40400)
-#  define CRYPTOPP_CXX11_ATOMICS 1
-#endif // atomics
-
-// alignof/alignas: MS at VS2013 (19.00); GCC at 4.8; Clang at 3.3; and Intel 15.0.
+// alignof/alignas: MS at VS2015 (19.00); GCC at 4.8; Clang at 3.3; and Intel 15.0.
 #if (CRYPTOPP_MSC_VERSION >= 1900)
 #  define CRYPTOPP_CXX11_ALIGNAS 1
 #  define CRYPTOPP_CXX11_ALIGNOF 1
